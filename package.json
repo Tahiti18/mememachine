@@ -1,0 +1,55 @@
+{
+  "name": "meme-coin-automation-platform",
+  "version": "1.0.0",
+  "description": "Cost-optimized platform for automated meme coin creation and trading",
+  "main": "index.js",
+  "scripts": {
+    "install:all": "npm install && npm run install:services",
+    "install:services": "cd services/social-monitor && npm install && cd ../sentiment-ai && npm install && cd ../token-creator && npm install && cd ../website-generator && npm install && cd ../trading-agent && npm install && cd ../cost-manager && npm install && cd ../../frontend && npm install",
+    "dev": "concurrently \"npm run dev:social-monitor\" \"npm run dev:sentiment-ai\" \"npm run dev:token-creator\" \"npm run dev:website-generator\" \"npm run dev:trading-agent\" \"npm run dev:cost-manager\" \"npm run dev:frontend\"",
+    "dev:social-monitor": "cd services/social-monitor && npm run dev",
+    "dev:sentiment-ai": "cd services/sentiment-ai && npm run dev",
+    "dev:token-creator": "cd services/token-creator && npm run dev",
+    "dev:website-generator": "cd services/website-generator && npm run dev",
+    "dev:trading-agent": "cd services/trading-agent && npm run dev",
+    "dev:cost-manager": "cd services/cost-manager && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "npm run build:services && npm run build:frontend",
+    "build:services": "cd services/social-monitor && npm run build && cd ../sentiment-ai && npm run build && cd ../token-creator && npm run build && cd ../website-generator && npm run build && cd ../trading-agent && npm run build && cd ../cost-manager && npm run build",
+    "build:frontend": "cd frontend && npm run build",
+    "build:docker": "docker-compose build",
+    "start": "docker-compose up -d",
+    "stop": "docker-compose down",
+    "test": "jest",
+    "test:integration": "jest --testPathPattern=integration",
+    "test:e2e": "jest --testPathPattern=e2e",
+    "test:load": "artillery run tests/load/load-test.yml",
+    "lint": "eslint . --ext .ts,.js",
+    "lint:fix": "eslint . --ext .ts,.js --fix"
+  },
+  "keywords": [
+    "meme-coin",
+    "solana",
+    "cryptocurrency",
+    "automation",
+    "trading-bot",
+    "sentiment-analysis",
+    "twitter-monitoring"
+  ],
+  "author": "Meme Coin Automation Team",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "artillery": "^2.0.0",
+    "concurrently": "^8.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "nodemon": "^3.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0"
+  }
+}
