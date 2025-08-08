@@ -32,7 +32,7 @@ const twitterMonitor = new TwitterMonitor({
 // Global state
 let systemStatus = {
   status: 'online',
-  mode: 'production', // Changed from demo to production
+  mode: 'production',  // Changed from 'demo' to 'production'
   apiHealth: {
     openrouter: false,
     twitter: false,
@@ -83,7 +83,7 @@ app.get('/api/status', async (req, res) => {
 // Set system mode
 app.post('/api/mode', (req, res) => {
   const { mode } = req.body;
-  const validModes = ['simulation', 'paper_trading', 'live']; // Removed demo
+  const validModes = ['simulation', 'paper_trading', 'live'];  // Removed 'demo'
 
   if (!validModes.includes(mode)) {
     return res.status(400).json({ error: 'Invalid mode' });
@@ -98,7 +98,7 @@ app.post('/api/mode', (req, res) => {
   });
 });
 
-// Tweet analysis endpoint - ALWAYS ACTIVE
+// Tweet analysis endpoint
 app.post('/api/analyze', async (req, res) => {
   try {
     const { tweet, author, metadata } = req.body;
@@ -135,222 +135,30 @@ app.post('/api/analyze', async (req, res) => {
   }
 });
 
-// Twitter monitoring endpoints - ALWAYS ACTIVE
-app.get('/api/twitter/monitor', async (req, res) => {
-  try {
-    const monitoringStatus = await twitterMonitor.getStatus();
-    res.json({
-      status: 'active',
-      monitoring: systemStatus.monitoring,
-      accounts: ['elonmusk', 'VitalikButerin', 'michael_saylor'],
-      ...monitoringStatus
-    });
-  } catch (error) {
-    console.error('Twitter monitor error:', error);
-    res.status(500).json({ error: 'Failed to get monitoring status' });
-  }
-});
-
-app.get('/api/twitter/analyze', async (req, res) => {
-  try {
-    const recentTweets = await twitterMonitor.getRecentTweets();
-    res.json({
-      success: true,
-      tweets: recentTweets,
-      analyzedCount: systemStatus.stats.tweetsAnalyzed
-    });
-  } catch (error) {
-    console.error('Twitter analyze error:', error);
-    res.status(500).json({ error: 'Failed to analyze tweets' });
-  }
-});
-
-app.get('/api/twitter/latest', async (req, res) => {
-  try {
-    const latestTweets = await twitterMonitor.getLatestTweets();
-    res.json({ tweets: latestTweets });
-  } catch (error) {
-    console.error('Latest tweets error:', error);
-    res.status(500).json({ error: 'Failed to get latest tweets' });
-  }
-});
-
-app.get('/api/twitter/sentiment', async (req, res) => {
-  try {
-    const sentimentData = await sentimentAnalyzer.getRecentAnalysis();
-    res.json({ sentiment: sentimentData });
-  } catch (error) {
-    console.error('Sentiment error:', error);
-    res.status(500).json({ error: 'Failed to get sentiment data' });
-  }
-});
-
-// AI Analysis endpoints - ALWAYS ACTIVE
-app.get('/api/ai/analyze', async (req, res) => {
-  try {
-    const aiStatus = aiEnsemble.getStatus();
-    res.json({
-      status: 'active',
-      ensemble: aiStatus,
-      analysisCapable: true
-    });
-  } catch (error) {
-    console.error('AI analyze error:', error);
-    res.status(500).json({ error: 'Failed to get AI analysis status' });
-  }
-});
-
-app.get('/api/ai/sentiment', async (req, res) => {
-  try {
-    const sentimentStats = await sentimentAnalyzer.getStats();
-    res.json({ sentiment: sentimentStats });
-  } catch (error) {
-    console.error('AI sentiment error:', error);
-    res.status(500).json({ error: 'Failed to get AI sentiment' });
-  }
-});
-
-app.get('/api/ai/ensemble', async (req, res) => {
-  try {
-    const ensembleStatus = aiEnsemble.getStatus();
-    res.json({ ensemble: ensembleStatus });
-  } catch (error) {
-    console.error('AI ensemble error:', error);
-    res.status(500).json({ error: 'Failed to get ensemble status' });
-  }
-});
-
-app.get('/api/sentiment/analyze', async (req, res) => {
-  try {
-    const analysis = await sentimentAnalyzer.getRecentAnalysis();
-    res.json({ analysis });
-  } catch (error) {
-    console.error('Sentiment analyze error:', error);
-    res.status(500).json({ error: 'Failed to analyze sentiment' });
-  }
-});
-
-// Token endpoints - ALWAYS ACTIVE
-app.get('/api/tokens/create', (req, res) => {
-  res.json({
-    message: 'Token creation endpoint active',
-    mode: systemStatus.mode,
-    tokensCreated: systemStatus.stats.tokensCreated
-  });
-});
-
-app.get('/api/tokens/list', (req, res) => {
-  res.json({
-    tokens: [],
-    totalCreated: systemStatus.stats.tokensCreated,
-    message: 'Token list endpoint active'
-  });
-});
-
-app.get('/api/tokens/status', (req, res) => {
-  res.json({
-    status: 'active',
-    tokensCreated: systemStatus.stats.tokensCreated,
-    successRate: systemStatus.stats.successRate
-  });
-});
-
-// Trading endpoints - ALWAYS ACTIVE
-app.get('/api/trading/status', (req, res) => {
-  res.json({
-    status: 'active',
-    mode: systemStatus.mode,
-    totalInvested: systemStatus.stats.totalInvested,
-    successRate: systemStatus.stats.successRate
-  });
-});
-
-app.get('/api/trading/history', (req, res) => {
-  res.json({
-    history: [],
-    totalTrades: 0,
-    message: 'Trading history endpoint active'
-  });
-});
-
-app.get('/api/performance', (req, res) => {
-  res.json({
-    performance: {
-      totalInvested: systemStatus.stats.totalInvested,
-      successRate: systemStatus.stats.successRate,
-      tweetsAnalyzed: systemStatus.stats.tweetsAnalyzed,
-      tokensCreated: systemStatus.stats.tokensCreated
-    },
-    status: 'active'
-  });
-});
-
-// Cost management - ALWAYS ACTIVE
-app.get('/api/costs', (req, res) => {
-  res.json({
-    totalCosts: 0,
-    breakdown: {
-      twitterAPI: 0,
-      openRouterAPI: 0,
-      tokenCreation: 0
-    },
-    status: 'active'
-  });
-});
-
-app.get('/api/costs/breakdown', (req, res) => {
-  res.json({
-    breakdown: {
-      daily: 0,
-      weekly: 0,
-      monthly: 0
-    },
-    status: 'active'
-  });
-});
-
-// Configuration - ALWAYS ACTIVE
-app.get('/api/config', (req, res) => {
-  res.json({
-    mode: systemStatus.mode,
-    apiHealth: systemStatus.apiHealth,
-    monitoring: systemStatus.monitoring,
-    status: 'active'
-  });
-});
-
-app.get('/api/settings', (req, res) => {
-  res.json({
-    settings: {
-      mode: systemStatus.mode,
-      monitoring: systemStatus.monitoring,
-      autoTrading: false
-    },
-    status: 'active'
-  });
-});
-
-// Start monitoring endpoint - NO DEMO RESTRICTIONS
+// Start monitoring endpoint - ALWAYS FUNCTIONAL
 app.post('/api/monitor/start', async (req, res) => {
   try {
     const { accounts = ['elonmusk', 'VitalikButerin', 'michael_saylor'] } = req.body;
 
-    // Start monitoring regardless of mode
+    // Start real monitoring regardless of mode
     await twitterMonitor.start(accounts);
     systemStatus.monitoring = true;
 
     console.log('Monitoring started for accounts:', accounts);
 
     res.json({
+      success: true,
       message: 'Monitoring started',
       accounts,
-      mode: systemStatus.mode,
-      status: 'active'
+      mode: systemStatus.mode
     });
 
   } catch (error) {
     console.error('Monitoring start error:', error);
-    res.status(500).json({ error: 'Failed to start monitoring' });
+    res.status(500).json({ 
+      error: 'Failed to start monitoring',
+      details: error.message 
+    });
   }
 });
 
@@ -363,6 +171,7 @@ app.post('/api/monitor/stop', async (req, res) => {
     console.log('Monitoring stopped');
 
     res.json({
+      success: true,
       message: 'Monitoring stopped',
       mode: systemStatus.mode
     });
@@ -373,20 +182,135 @@ app.post('/api/monitor/stop', async (req, res) => {
   }
 });
 
-// Get recent tweets endpoint - NO DEMO MODE
+// Get recent tweets endpoint - ALWAYS TRIES REAL DATA
 app.get('/api/tweets/recent', async (req, res) => {
   try {
     // Always try to get real tweets
     const tweets = await twitterMonitor.getRecentTweets();
-    res.json({ tweets });
+    
+    res.json({ 
+      success: true,
+      tweets,
+      mode: systemStatus.mode,
+      timestamp: new Date().toISOString()
+    });
 
   } catch (error) {
     console.error('Recent tweets error:', error);
-    res.status(500).json({ error: 'Failed to get recent tweets' });
+    
+    // Return error instead of demo data
+    res.status(500).json({ 
+      error: 'Failed to get recent tweets',
+      details: error.message,
+      suggestion: 'Check Twitter API configuration'
+    });
   }
 });
 
-// Token creation endpoint - NO DEMO RESTRICTIONS
+// Twitter monitoring endpoints
+app.get('/api/twitter/monitor', async (req, res) => {
+  try {
+    const status = await twitterMonitor.getStatus();
+    res.json({
+      success: true,
+      monitoring: systemStatus.monitoring,
+      status,
+      mode: systemStatus.mode
+    });
+  } catch (error) {
+    console.error('Twitter monitor status error:', error);
+    res.status(500).json({ error: 'Failed to get monitor status' });
+  }
+});
+
+app.post('/api/twitter/analyze', async (req, res) => {
+  try {
+    const { tweet, author } = req.body;
+    
+    if (!tweet) {
+      return res.status(400).json({ error: 'Tweet content required' });
+    }
+
+    const analysis = await sentimentAnalyzer.analyzeTweet({
+      content: tweet,
+      author: author || 'unknown'
+    });
+
+    systemStatus.stats.tweetsAnalyzed++;
+
+    res.json({
+      success: true,
+      analysis,
+      mode: systemStatus.mode
+    });
+
+  } catch (error) {
+    console.error('Tweet analysis error:', error);
+    res.status(500).json({ error: 'Analysis failed', details: error.message });
+  }
+});
+
+// AI Analysis endpoints
+app.get('/api/ai/analyze', async (req, res) => {
+  try {
+    const { text, type = 'sentiment' } = req.query;
+    
+    if (!text) {
+      return res.status(400).json({ error: 'Text parameter required' });
+    }
+
+    const analysis = await aiEnsemble.analyze(text, type);
+    
+    res.json({
+      success: true,
+      analysis,
+      type,
+      mode: systemStatus.mode
+    });
+
+  } catch (error) {
+    console.error('AI analysis error:', error);
+    res.status(500).json({ error: 'AI analysis failed', details: error.message });
+  }
+});
+
+app.get('/api/ai/sentiment', async (req, res) => {
+  try {
+    const { text } = req.query;
+    
+    if (!text) {
+      return res.status(400).json({ error: 'Text parameter required' });
+    }
+
+    const sentiment = await sentimentAnalyzer.analyze(text);
+    
+    res.json({
+      success: true,
+      sentiment,
+      mode: systemStatus.mode
+    });
+
+  } catch (error) {
+    console.error('Sentiment analysis error:', error);
+    res.status(500).json({ error: 'Sentiment analysis failed', details: error.message });
+  }
+});
+
+app.get('/api/ai/ensemble', async (req, res) => {
+  try {
+    const status = aiEnsemble.getStatus();
+    res.json({
+      success: true,
+      ensemble: status,
+      mode: systemStatus.mode
+    });
+  } catch (error) {
+    console.error('AI ensemble error:', error);
+    res.status(500).json({ error: 'Failed to get ensemble status' });
+  }
+});
+
+// Token creation endpoint - FUNCTIONAL FOR ALL MODES
 app.post('/api/token/create', async (req, res) => {
   try {
     const { tweetAnalysis, tokenData } = req.body;
@@ -396,46 +320,57 @@ app.post('/api/token/create', async (req, res) => {
       systemStatus.stats.tokensCreated++;
 
       return res.json({
+        success: true,
         message: `${systemStatus.mode} - token creation simulated`,
         token: {
-          name: tokenData.name || 'SIMULATOKEN',
-          symbol: tokenData.symbol || 'SIM',
+          name: tokenData?.name || 'SIMULATOKEN',
+          symbol: tokenData?.symbol || 'SIM',
           created: true,
           cost: 0,
-          simulation: true
+          simulation: true,
+          mode: systemStatus.mode
         }
       });
     }
 
     // Live mode - actual token creation would go here
-    // This would integrate with Solana/pump.fun
     res.json({
-      message: 'Live token creation ready for implementation',
+      success: false,
+      message: 'Live token creation requires Solana integration',
       mode: 'live',
       requiresImplementation: true
     });
 
   } catch (error) {
     console.error('Token creation error:', error);
-    res.status(500).json({ error: 'Token creation failed' });
+    res.status(500).json({ error: 'Token creation failed', details: error.message });
   }
 });
 
 // AI ensemble status endpoint
 app.get('/api/ai/status', (req, res) => {
-  const ensembleStatus = aiEnsemble.getStatus();
-  res.json({
-    ensemble: ensembleStatus,
-    router: modelRouter.getStats(),
-    timestamp: new Date().toISOString(),
-    status: 'active'
-  });
+  try {
+    const ensembleStatus = aiEnsemble.getStatus();
+    res.json({
+      success: true,
+      ensemble: ensembleStatus,
+      router: modelRouter.getStats(),
+      mode: systemStatus.mode,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('AI status error:', error);
+    res.status(500).json({ error: 'Failed to get AI status' });
+  }
 });
 
 // Helper functions
 async function checkOpenRouterHealth() {
   try {
-    if (!process.env.OPENROUTER_API_KEY) return false;
+    if (!process.env.OPENROUTER_API_KEY) {
+      console.log('OpenRouter API key not configured');
+      return false;
+    }
 
     const response = await axios.get('https://openrouter.ai/api/v1/models', {
       headers: {
@@ -445,6 +380,7 @@ async function checkOpenRouterHealth() {
       timeout: 5000
     });
 
+    console.log('OpenRouter health check: SUCCESS');
     return response.status === 200;
   } catch (error) {
     console.error('OpenRouter health check failed:', error.message);
@@ -454,7 +390,10 @@ async function checkOpenRouterHealth() {
 
 async function checkTwitterHealth() {
   try {
-    if (!process.env.TWITTER_API_KEY) return false;
+    if (!process.env.TWITTER_API_KEY) {
+      console.log('Twitter API key not configured');
+      return false;
+    }
 
     const response = await axios.get('https://api.twitterapi.io/v2/users/by/username/elonmusk', {
       headers: {
@@ -463,6 +402,7 @@ async function checkTwitterHealth() {
       timeout: 5000
     });
 
+    console.log('Twitter health check: SUCCESS');
     return response.status === 200;
   } catch (error) {
     console.error('Twitter health check failed:', error.message);
@@ -474,7 +414,7 @@ async function checkTwitterHealth() {
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Meme Coin Automation Platform running on port ${PORT}`);
   console.log(`📊 AI Ensemble Mode: ${process.env.AI_ENSEMBLE_MODE || 'adaptive'}`);
-  console.log(`🎯 System Mode: PRODUCTION (Demo mode removed)`);
+  console.log(`🎯 System Mode: PRODUCTION (Demo mode disabled)`);
   console.log(`🔗 OpenRouter API: ${process.env.OPENROUTER_API_KEY ? 'Connected' : 'Not configured'}`);
   console.log(`🐦 Twitter API: ${process.env.TWITTER_API_KEY ? 'Connected' : 'Not configured'}`);
 });
