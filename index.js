@@ -68,6 +68,38 @@ app.get('/api/analysis', (req, res) => {
   });
 });
 
+// Environment Variables Test Endpoint
+app.get('/test/config', (req, res) => {
+  const maskApiKey = (key) => {
+    if (!key) return 'NOT_SET';
+    return key.substring(0, 10) + '...' + key.substring(key.length - 6);
+  };
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    environment_variables: {
+      openrouter_key: process.env.OPENROUTER_API_KEY ? '✅ SET' : '❌ MISSING',
+      openrouter_masked: maskApiKey(process.env.OPENROUTER_API_KEY),
+      twitter_key: process.env.TWITTER_API_KEY ? '✅ SET' : '❌ MISSING', 
+      twitter_masked: maskApiKey(process.env.TWITTER_API_KEY),
+      ensemble_mode: process.env.AI_ENSEMBLE_MODE || '❌ NOT_SET',
+      confidence_threshold: process.env.CONFIDENCE_THRESHOLD || '❌ NOT_SET',
+      voting_method: process.env.ENSEMBLE_VOTING || '❌ NOT_SET'
+    },
+    models: {
+      primary: process.env.PRIMARY_MODEL || '❌ NOT_SET',
+      secondary: process.env.SECONDARY_MODEL || '❌ NOT_SET',
+      premium: process.env.PREMIUM_MODEL || '❌ NOT_SET', 
+      backup: process.env.BACKUP_MODEL || '❌ NOT_SET'
+    },
+    system_status: {
+      platform: 'Bridge Mode Active',
+      apis_configured: (process.env.OPENROUTER_API_KEY && process.env.TWITTER_API_KEY) ? '✅ READY' : '❌ INCOMPLETE',
+      next_step: 'Upload services files for full activation'
+    }
+  });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Error:', err.stack);
