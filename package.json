@@ -1,24 +1,44 @@
 {
-  "name": "mememachine",
-  "version": "1.0.0",
-  "description": "Automated meme coin creation platform",
+  "name": "meme-coin-automation-platform",
+  "version": "2.0.0",
+  "description": "Advanced meme coin automation platform with multi-model AI ensemble",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "echo 'Build complete'",
-    "dev": "node index.js"
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "express": "4.18.2",
-    "cors": "2.8.5",
-    "dotenv": "16.3.1",
-    "axios": "1.4.0",
-    "redis": "4.6.7",
-    "winston": "3.10.0",
-    "node-cron": "3.0.2"
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "morgan": "^1.10.0",
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.0",
+    "ws": "^8.14.2",
+    "node-cron": "^3.0.2",
+    "openai": "^4.20.1",
+    "twitter-api-v2": "^1.15.0",
+    "express-rate-limit": "^7.1.5",
+    "compression": "^1.7.4",
+    "body-parser": "^1.20.2",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": "18.x",
-    "npm": "9.x"
-  }
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "meme-coin",
+    "automation",
+    "ai-ensemble",
+    "sentiment-analysis",
+    "openrouter",
+    "trading-bot"
+  ],
+  "author": "Meme Coin Platform",
+  "license": "ISC"
 }
+
