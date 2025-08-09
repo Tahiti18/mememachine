@@ -1,25 +1,12 @@
 const axios = require('axios');
-
-// ---- Hard-coded IDs (no lookups; stable even if handles change)
-const ID_MAP = {
-  elonmusk:       '44196397',
-  vitalikbuterin: '295218901',
-  michael_saylor: '244647486',
-  justinsuntron:  '1023900737',
-  cz_binance:     '888059910',
-  naval:          '745273',
-  APompliano:     '361289499',
-  balajis:        '36563169',
-  coinbureau:     '1109836680455862273',
-  WhalePanda:     '14198485'
-};
+const { resolveHandleToIdWithSource } = require('./twitterUserResolver');
 
 class TwitterMonitor {
   constructor(options = {}) {
     this.apiKey = options.apiKey;
     this.sentimentAnalyzer = options.sentimentAnalyzer;
 
-    this.monitoringAccounts = [];  // [{ id, label }]
+    this.monitoringAccounts = [];      // [{ id, label }]
     this.isMonitoring = false;
     this.isFetching = false;
     this.tweets = [];
@@ -28,8 +15,8 @@ class TwitterMonitor {
     // pacing (env)
     const envPoll = parseInt(process.env.TWEET_CHECK_INTERVAL || '60000', 10);
     this.pollInterval = Math.max(30000, isNaN(envPoll) ? 60000 : envPoll);
-    const envGap = parseInt(process.env.PER_REQUEST_GAP_MS || '7000', 10);
-    this.perRequestGapMs = Math.max(5500, isNaN(envGap) ? 7000 : envGap);
+    const envGap = parseInt(process.env.PER_REQUEST_GAP_MS || '9000', 10);
+    this.perRequestGapMs = Math.max(7000, isNaN(envGap) ? 9000 : envGap);
     const envRetry = parseInt(process.env.RETRY_BACKOFF_MS || `${this.pollInterval}`, 10);
     this.retryBackoffMs = Math.max(this.perRequestGapMs, isNaN(envRetry) ? this.pollInterval : envRetry);
 
@@ -39,7 +26,6 @@ class TwitterMonitor {
     this.rateLimitReset = null;
     this.lastSeenIdByUser = {}; // key=id -> since_id
 
-    // default list uses known handles; we immediately map to IDs from ID_MAP
     const defaultHandles = [
       'elonmusk','vitalikbuterin','michael_saylor','justinsuntron',
       'cz_binance','naval','APompliano','balajis','coinbureau','WhalePanda'
@@ -57,32 +43,28 @@ class TwitterMonitor {
     }
   }
 
-  // Accepts mix of handles and numeric IDs; prefers hard-coded IDs; skips any unknown handle
   async start(accounts = []) {
     if (this.isMonitoring) return { success: true, message: 'Already monitoring' };
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
-    const targets = [];
     const unique = [...new Set(accounts)].map(v => String(v).trim()).filter(Boolean);
+    const targets = [];
 
-    for (const v of unique) {
-      if (/^\d+$/.test(v)) { // numeric id provided
-        targets.push({ id: v, label: v });
-        continue;
-      }
-      const handle = v.replace(/^@/, '');
-      const id = ID_MAP[handle] || ID_MAP[handle.toLowerCase()];
+    for (let i = 0; i < unique.length; i++) {
+      const v = unique[i];
+      if (/^\d+$/.test(v)) { targets.push({ id: v, label: v }); continue; }
+      const handle = v.replace(/^@/, '').trim();
+      if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
+      const { id, source } = await resolveHandleToIdWithSource(handle);
       if (id) {
-        console.log(`🔒 Using hard-coded ID for @${handle} -> ${id} (local-map)`);
+        console.log(`🔎 Using ID for @${handle} -> ${id} (${source})`);
         targets.push({ id, label: handle });
       } else {
-        console.warn(`⏭️ Skipping @${handle}: not in local ID map (no lookups in this mode)`);
+        console.warn(`⏭️ Skipping @${handle}: no ID in cache/defaults`);
       }
     }
 
-    if (targets.length === 0) {
-      throw new Error('No valid accounts after applying hard-coded ID map.');
-    }
+    if (!targets.length) throw new Error('No valid accounts to monitor.');
 
     this.monitoringAccounts = targets;
     this.isMonitoring = true;
@@ -95,7 +77,7 @@ class TwitterMonitor {
 
     return {
       success: true,
-      message: 'Monitoring started (local-map mode)',
+      message: 'Monitoring started (cache/local-map mode)',
       accounts: this.monitoringAccounts,
       pollInterval: this.pollInterval
     };
@@ -119,9 +101,9 @@ class TwitterMonitor {
         const target = this.monitoringAccounts[i];
         try {
           if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
-          const userTweets = await this.fetchTweetsForTarget(target);
-          newTweets.push(...userTweets);
-        } catch { /* logged inside */ }
+          const tweets = await this.fetchTweetsForTarget(target);
+          newTweets.push(...tweets);
+        } catch { /* errors already logged */ }
       }
 
       newTweets.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -141,18 +123,14 @@ class TwitterMonitor {
       timeout: 12000
     });
 
-    const key = target.id; // in this mode we always have an id
+    const key = target.id; // we always monitor by ID
     const sinceId = this.lastSeenIdByUser[key];
     const params = { limit: 10, ...(sinceId ? { since_id: sinceId } : {}) };
 
-    // Prefer ID endpoint; if provider lacks it, optionally fall back to handle endpoint (rare)
-    const paths = [
-      `/tweets/user-id/${encodeURIComponent(key)}`,
-      // fallback would require a handle; we skip since this mode is ID-only to avoid 404s:
-      // `/tweets/user/${encodeURIComponent(target.label)}`
-    ];
+    // Only the ID endpoint (consistent, fewer 404s)
+    const path = `/tweets/user-id/${encodeURIComponent(key)}`;
 
-    const requestWithRetry = async (path) => {
+    const requestWithRetry = async () => {
       try {
         return await client.get(path, { params });
       } catch (err) {
@@ -166,15 +144,7 @@ class TwitterMonitor {
     };
 
     try {
-      let resp;
-      for (const p of paths) {
-        try { resp = await requestWithRetry(p); break; }
-        catch (e) {
-          const st = e?.response?.status;
-          console.warn(`TwitterAPI.io error for ${key} on ${p} [${st || 'ERR'}]`);
-          if (st && st !== 404) throw e; // non-404 -> abort
-        }
-      }
+      const resp = await requestWithRetry();
       const raw = resp?.data?.data || [];
       if (!Array.isArray(raw) || raw.length === 0) return [];
 
@@ -193,14 +163,14 @@ class TwitterMonitor {
       if (mapped.length > 0) this.lastSeenIdByUser[key] = mapped[0].id;
       return mapped;
     } catch (error) {
-      const data = error?.response?.data;
       const status = error?.response?.status;
+      const data = error?.response?.data;
       console.error(
-        `TwitterAPI.io final error for ${key}${status ? ` [${status}]` : ''}: ${
+        `TwitterAPI.io error for ${key}${status ? ` [${status}]` : ''}: ${
           data ? JSON.stringify(data).slice(0,300) : (error.message || 'Unknown error')
         }`
       );
-      return []; // swallow to keep loop healthy
+      return [];
     }
   }
 
@@ -220,7 +190,9 @@ class TwitterMonitor {
               context_annotations: tweet.context_annotations
             }
           });
-        } catch { analysis = this.getFallbackAnalysis(tweet); }
+        } catch {
+          analysis = this.getFallbackAnalysis(tweet);
+        }
       } else {
         analysis = this.getFallbackAnalysis(tweet);
       }
