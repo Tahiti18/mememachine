@@ -1,147 +1,212 @@
-// index.js
-// MemesMachine API — real handlers only
+// index.js — single file that wires the server, Twitter monitor routes, and AI routes
 
 require('dotenv').config();
-
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const bodyParser = require('body-parser');
+const axios = require('axios');
 
-const twitterMonitor = require('./services/twitterMonitor'); // your real monitor (start/stop/getStatus/getRecentTweets)
+const { startMonitoring, stopMonitoring, getRecentTweets, getStatus: getTwStatus } =
+  require('./services/twitterMonitor');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
 
-// ---------- Middleware
+// ---------- middleware ----------
+app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
 app.use(compression());
-
-// Basic rate limit so the dashboard/diagnostics can’t spam your API
+app.use(bodyParser.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
 app.use(
-  '/api/',
   rateLimit({
     windowMs: 60 * 1000,
-    max: 120, // 120 requests/minute per IP under /api
+    max: 120,
     standardHeaders: true,
     legacyHeaders: false,
   })
 );
 
-// ---------- Root health (used by Diagnostics)
+// ---------- tiny helpers ----------
+const has = (v) => typeof v === 'string' ? v.trim().length > 0 : !!v;
+const ok = (res, data) => res.json(data);
+const err = (res, code, message) => res.status(code).json({ ok: false, error: message });
+
+// ---------- root & basic status ----------
 app.get('/', (_req, res) => {
-  res.type('text').send('MemesMachine API online');
+  res.type('text/plain').send('MemesMachine API online');
 });
 
-// ---------- Platform status (used by Diagnostics + UI cards)
-app.get('/api/status', async (_req, res) => {
-  try {
-    const tw = twitterMonitor.getStatus();
-
-    // “Real enough” health: OpenRouter available if key present, db is in-memory for now
-    const apiHealth = {
-      openrouter: Boolean(process.env.OPENROUTER_API_KEY),
-      database: true, // you’re not using an external DB yet
-    };
-
-    // simple roll-up stats for the UI
-    const recent = twitterMonitor.getRecentTweets(50);
-    const stats = {
+app.get('/api/status', (_req, res) => {
+  ok(res, {
+    status: 'online',
+    monitoring: true,
+    apiHealth: {
+      openrouter: has(process.env.OPENROUTER_API_KEY),
+      database: true, // no external DB right now; server is alive
+    },
+    stats: {
       totalInvested: 0,
-      tweetsAnalyzed: recent.length,
+      tweetsAnalyzed: 0,
       tokensCreated: 0,
       successRate: 0,
-    };
-
-    res.json({
-      status: 'online',
-      monitoring: tw.monitoring,
-      apiHealth,
-      stats,
-      twitter: {
-        priority: tw.priorityAccounts,
-        base: tw.baseAccounts,
-        lastPollAtPriority: tw.lastPollAtPriority,
-        lastPollAtBase: tw.lastPollAtBase,
-        suspended: tw.suspended,
-        suspendedUntil: tw.suspendedUntil,
-      },
-    });
-  } catch (err) {
-    console.error('GET /api/status failed:', err);
-    res.status(500).json({ ok: false, error: 'status_failed' });
-  }
+    },
+  });
 });
 
-// ---------- Twitter monitor controls (REAL)
+// ---------- Twitter monitor endpoints ----------
 app.post('/api/monitor/start', async (_req, res) => {
   try {
-    const result = await twitterMonitor.startMonitoring();
-    res.json(result);
-  } catch (err) {
-    console.error('POST /api/monitor/start:', err?.message || err);
-    res.status(500).json({ ok: false, error: 'start_failed' });
+    const out = await startMonitoring();
+    ok(res, { ok: true, message: out?.message || 'started' });
+  } catch (e) {
+    err(res, 500, e?.message || 'start failed');
   }
 });
 
-app.post('/api/monitor/stop', (_req, res) => {
+app.post('/api/monitor/stop', async (_req, res) => {
   try {
-    const result = twitterMonitor.stopMonitoring();
-    res.json(result);
-  } catch (err) {
-    console.error('POST /api/monitor/stop:', err?.message || err);
-    res.status(500).json({ ok: false, error: 'stop_failed' });
+    const out = await stopMonitoring();
+    ok(res, { ok: true, message: out?.message || 'stopped' });
+  } catch (e) {
+    err(res, 500, e?.message || 'stop failed');
   }
 });
 
-// Monitor status endpoint (your diagnostics expects this)
-app.get('/api/twitter/monitor', (_req, res) => {
-  try {
-    const st = twitterMonitor.getStatus();
-    res.json({ ok: true, ...st });
-  } catch (err) {
-    console.error('GET /api/twitter/monitor:', err?.message || err);
-    res.status(500).json({ ok: false, error: 'monitor_status_failed' });
-  }
-});
-
-// Recent tweets for the dashboard “Live Tweet Monitor”
 app.get('/api/tweets/recent', (req, res) => {
+  const n = parseInt(req.query.limit || '20', 10);
+  ok(res, { tweets: getRecentTweets(n) });
+});
+
+app.get('/api/twitter/monitor', (_req, res) => ok(res, getTwStatus()));
+
+// ---------- AI routes (fixes your 404s) ----------
+const OR_KEY = process.env.OPENROUTER_API_KEY || '';
+const PRIMARY_MODEL = process.env.PRIMARY_MODEL || 'anthropic/claude-3-haiku';
+const SECONDARY_MODEL = process.env.SECONDARY_MODEL || 'anthropic/claude-3-haiku';
+const PREMIUM_MODEL = process.env.PREMIUM_MODEL || 'anthropic/claude-3.5-sonnet';
+const BACKUP_MODEL = process.env.BACKUP_MODEL || 'qwen/qwen-2.5-72b-instruct';
+const ENSEMBLE_MODE = process.env.AI_ENSEMBLE_MODE || 'adaptive';
+const ENSEMBLE_VOTING = process.env.ENSEMBLE_VOTING || 'weighted';
+const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85');
+
+async function openRouterChat(messages, model) {
+  if (!OR_KEY) throw new Error('OpenRouter API key missing');
+  const res = await axios.post(
+    'https://openrouter.ai/api/v1/chat/completions',
+    { model, messages, temperature: 0.2 },
+    {
+      timeout: 15000,
+      headers: {
+        Authorization: `Bearer ${OR_KEY}`,
+        'HTTP-Referer': 'https://memesmachine.netlify.app',
+        'X-Title': 'MemesMachine',
+      },
+    }
+  );
+  const text = res?.data?.choices?.[0]?.message?.content || '';
+  return text.trim();
+}
+
+app.get('/api/ai/ensemble', (_req, res) =>
+  ok(res, {
+    ok: true,
+    mode: ENSEMBLE_MODE,
+    voting: ENSEMBLE_VOTING,
+    threshold: CONFIDENCE_THRESHOLD,
+    models: {
+      primary: PRIMARY_MODEL,
+      secondary: SECONDARY_MODEL,
+      premium: PREMIUM_MODEL,
+      backup: BACKUP_MODEL,
+    },
+  })
+);
+
+app.get('/api/ai/status', (_req, res) =>
+  ok(res, {
+    ok: true,
+    mode: ENSEMBLE_MODE,
+    voting: ENSEMBLE_VOTING,
+    threshold: CONFIDENCE_THRESHOLD,
+    models: {
+      primary: PRIMARY_MODEL,
+      secondary: SECONDARY_MODEL,
+      premium: PREMIUM_MODEL,
+      backup: BACKUP_MODEL,
+    },
+    openrouterKey: !!OR_KEY,
+  })
+);
+
+// GET /api/ai/sentiment?text=hello
+app.get('/api/ai/sentiment', async (req, res) => {
+  const text = (req.query.text || '').toString().trim();
+  if (!text) return err(res, 400, 'missing text');
+
+  const prompt = [
+    {
+      role: 'system',
+      content:
+        'Return a single integer 0-100 called "score" for the sentiment of the text (0 very negative, 100 very positive). Respond ONLY with the number.',
+    },
+    { role: 'user', content: text },
+  ];
+
   try {
-    const limit = Number(req.query.limit || 20);
-    const tweets = twitterMonitor.getRecentTweets(limit);
-    // Map to UI schema (content/author/timestamp/url) w/o fake analysis
-    const mapped = tweets.map(t => ({
-      id: t.id,
-      content: t.text,
-      author: t.author,
-      timestamp: t.created_at,
-      url: t.url,
-      analysis: t.analysis || null,
-      signal: t.signal || 'PROCESSING',
-    }));
-    res.json({ tweets: mapped });
-  } catch (err) {
-    console.error('GET /api/tweets/recent:', err?.message || err);
-    res.status(500).json({ ok: false, error: 'recent_failed' });
+    let raw = await openRouterChat(prompt, PRIMARY_MODEL);
+    let score = parseInt((raw.match(/-?\d+/) || [0])[0], 10);
+    if (Number.isNaN(score)) {
+      raw = await openRouterChat(prompt, BACKUP_MODEL);
+      score = parseInt((raw.match(/-?\d+/) || [0])[0], 10);
+    }
+    score = Math.max(0, Math.min(100, score || 0));
+    ok(res, { ok: true, score });
+  } catch (e) {
+    err(res, 500, e?.message || 'sentiment failed');
   }
 });
 
-// ---------- Error fallthrough
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: 'not_found', path: req.path });
+// GET /api/ai/analyze?text=hello
+app.get('/api/ai/analyze', async (req, res) => {
+  const text = (req.query.text || '').toString().trim();
+  if (!text) return err(res, 400, 'missing text');
+
+  const prompt = [
+    {
+      role: 'system',
+      content:
+        'Summarize the text in <=40 words and classify sentiment as NEG/NEU/POS. Return JSON: {"summary":"...","sentiment":"NEG|NEU|POS"}.',
+    },
+    { role: 'user', content: text },
+  ];
+
+  try {
+    let out = await openRouterChat(prompt, SECONDARY_MODEL);
+    // try to parse JSON; if not, fallback wrap
+    let json;
+    try {
+      json = JSON.parse(out);
+    } catch {
+      json = { summary: out.slice(0, 240), sentiment: 'NEU' };
+    }
+    ok(res, { ok: true, ...json });
+  } catch (e) {
+    err(res, 500, e?.message || 'analyze failed');
+  }
 });
 
-// ---------- Boot
+// ---------- boot ----------
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
-
-  // Optional auto-start monitoring at boot (keeps your current behavior)
+  // auto-start monitor on boot so the dashboard shows ACTIVE
   try {
-    const result = await twitterMonitor.startMonitoring();
-    if (!result.ok) console.warn('Auto-start monitoring skipped:', result.message || result);
+    await startMonitoring();
   } catch (e) {
-    console.error('Auto-start monitoring failed:', e?.message || e);
+    console.warn('Twitter monitor did not auto-start:', e?.message || e);
   }
 });
