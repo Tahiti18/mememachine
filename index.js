@@ -1,143 +1,147 @@
-// /index.js
-const express = require('express');
-const cors = require('cors');
+// index.js
+// MemesMachine API — real handlers only
+
 require('dotenv').config();
 
-const TwitterMonitor = require('./services/twitterMonitor'); // your working twitterAPI.io monitor
-const AI = require('./services/aiEnsemble');                 // <- file from step 1
+const express = require('express');
+const cors = require('cors');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+
+const twitterMonitor = require('./services/twitterMonitor'); // your real monitor (start/stop/getStatus/getRecentTweets)
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// ---------- Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.use(compression());
 
-// ---- Twitter monitor wiring
-const monitor = {
-  started: false,
-  svc: null,
-};
+// Basic rate limit so the dashboard/diagnostics can’t spam your API
+app.use(
+  '/api/',
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120, // 120 requests/minute per IP under /api
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-async function ensureMonitor() {
-  if (!monitor.started) {
-    monitor.svc = require('./services/twitterMonitor');
-    await monitor.svc.startMonitoring();
-    monitor.started = true;
-  }
-}
+// ---------- Root health (used by Diagnostics)
+app.get('/', (_req, res) => {
+  res.type('text').send('MemesMachine API online');
+});
 
-// Basic status for dashboard
+// ---------- Platform status (used by Diagnostics + UI cards)
 app.get('/api/status', async (_req, res) => {
   try {
-    const m = monitor.svc ? monitor.svc.getStatus() : { monitoring: false };
+    const tw = twitterMonitor.getStatus();
+
+    // “Real enough” health: OpenRouter available if key present, db is in-memory for now
+    const apiHealth = {
+      openrouter: Boolean(process.env.OPENROUTER_API_KEY),
+      database: true, // you’re not using an external DB yet
+    };
+
+    // simple roll-up stats for the UI
+    const recent = twitterMonitor.getRecentTweets(50);
+    const stats = {
+      totalInvested: 0,
+      tweetsAnalyzed: recent.length,
+      tokensCreated: 0,
+      successRate: 0,
+    };
+
     res.json({
       status: 'online',
-      monitoring: !!m?.monitoring || !!m?.isMonitoring,
-      apiHealth: {
-        openrouter: !!process.env.OPENROUTER_API_KEY,
-        database: true
+      monitoring: tw.monitoring,
+      apiHealth,
+      stats,
+      twitter: {
+        priority: tw.priorityAccounts,
+        base: tw.baseAccounts,
+        lastPollAtPriority: tw.lastPollAtPriority,
+        lastPollAtBase: tw.lastPollAtBase,
+        suspended: tw.suspended,
+        suspendedUntil: tw.suspendedUntil,
       },
-      stats: {
-        totalInvested: 0,
-        tweetsAnalyzed: (monitor.svc?.getRecentTweets()?.length || 0),
-        tokensCreated: 0,
-        successRate: 0
-      }
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error('GET /api/status failed:', err);
+    res.status(500).json({ ok: false, error: 'status_failed' });
   }
 });
 
-// Tweets endpoints
-app.get('/api/tweets/recent', (_req, res) => {
-  try {
-    const tweets = monitor.svc?.getRecentTweets(50) || [];
-    res.json({ tweets });
-  } catch (e) {
-    res.status(500).json({ error: e.message, tweets: [] });
-  }
-});
-
+// ---------- Twitter monitor controls (REAL)
 app.post('/api/monitor/start', async (_req, res) => {
   try {
-    await ensureMonitor();
-    res.json({ ok: true, message: 'already running' });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    const result = await twitterMonitor.startMonitoring();
+    res.json(result);
+  } catch (err) {
+    console.error('POST /api/monitor/start:', err?.message || err);
+    res.status(500).json({ ok: false, error: 'start_failed' });
   }
 });
 
 app.post('/api/monitor/stop', (_req, res) => {
   try {
-    if (monitor.svc) monitor.svc.stopMonitoring();
-    monitor.started = false;
-    res.json({ ok: true, message: 'stopped' });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- REAL AI routes (no placeholders)
-
-// health
-app.get('/api/ai/status', (_req, res) => {
-  try {
-    res.json({ ok: true, ...AI.status() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ensemble meta (alias)
-app.get('/api/ai/ensemble', (_req, res) => {
-  try {
-    res.json(AI.status());
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// sentiment (GET: ?text=... or POST: {text})
-app.get('/api/ai/sentiment', async (req, res) => {
-  try {
-    const text = (req.query.text || '').toString();
-    if (!text) return res.status(400).json({ error: 'text is required' });
-    const result = await AI.analyzeSentiment(text);
+    const result = twitterMonitor.stopMonitoring();
     res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error('POST /api/monitor/stop:', err?.message || err);
+    res.status(500).json({ ok: false, error: 'stop_failed' });
   }
 });
 
-app.post('/api/ai/sentiment', async (req, res) => {
+// Monitor status endpoint (your diagnostics expects this)
+app.get('/api/twitter/monitor', (_req, res) => {
   try {
-    const text = (req.body?.text || '').toString();
-    if (!text) return res.status(400).json({ error: 'text is required' });
-    const result = await AI.analyzeSentiment(text);
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    const st = twitterMonitor.getStatus();
+    res.json({ ok: true, ...st });
+  } catch (err) {
+    console.error('GET /api/twitter/monitor:', err?.message || err);
+    res.status(500).json({ ok: false, error: 'monitor_status_failed' });
   }
 });
 
-// general analyze (POST: {content})
-app.post('/api/ai/analyze', async (req, res) => {
+// Recent tweets for the dashboard “Live Tweet Monitor”
+app.get('/api/tweets/recent', (req, res) => {
   try {
-    const content = (req.body?.content || '').toString();
-    if (!content) return res.status(400).json({ error: 'content is required' });
-    const out = await AI.generalAnalyze(content);
-    res.json({ analysis: out });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    const limit = Number(req.query.limit || 20);
+    const tweets = twitterMonitor.getRecentTweets(limit);
+    // Map to UI schema (content/author/timestamp/url) w/o fake analysis
+    const mapped = tweets.map(t => ({
+      id: t.id,
+      content: t.text,
+      author: t.author,
+      timestamp: t.created_at,
+      url: t.url,
+      analysis: t.analysis || null,
+      signal: t.signal || 'PROCESSING',
+    }));
+    res.json({ tweets: mapped });
+  } catch (err) {
+    console.error('GET /api/tweets/recent:', err?.message || err);
+    res.status(500).json({ ok: false, error: 'recent_failed' });
   }
 });
 
-// root (optional)
-app.get('/', (_req, res) => res.send('MemesMachine API online'));
+// ---------- Error fallthrough
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'not_found', path: req.path });
+});
 
-// ---- boot
+// ---------- Boot
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
-  try { await ensureMonitor(); } catch (e) { console.warn('Monitor failed to start:', e.message); }
+
+  // Optional auto-start monitoring at boot (keeps your current behavior)
+  try {
+    const result = await twitterMonitor.startMonitoring();
+    if (!result.ok) console.warn('Auto-start monitoring skipped:', result.message || result);
+  } catch (e) {
+    console.error('Auto-start monitoring failed:', e?.message || e);
+  }
 });
