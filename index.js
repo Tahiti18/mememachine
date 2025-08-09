@@ -1,4 +1,4 @@
-// index.js  — MemesMachine API (no auto-start, no placeholders)
+// index.js — MemesMachine API (manual start, real TwitterAPI.io + OpenRouter if keys present)
 
 require('dotenv').config();
 const express = require('express');
@@ -6,13 +6,11 @@ const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 
-// ---------- Express setup ----------
+// ---------- Express ----------
 const app = express();
-app.set('trust proxy', 1);                    // Railway/Netlify proxy fix (rate-limit + X-Forwarded-For)
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
-
-// Global rate-limit (protects credits & API)
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -23,36 +21,36 @@ app.use(
   })
 );
 
-const PORT = process.env.PORT || 8080;
+const PORT = parseInt(process.env.PORT || '8080', 10);
 
-// ---------- ENV & Config ----------
+// ---------- ENV / Config ----------
 const TWITTER_API_KEY = process.env.TWITTER_API_KEY || '';
-
-const PRIORITY = (process.env.PRIORITY_ACCOUNTS || '')
-  .split(',').map(s => s.trim()).filter(Boolean).slice(0, 3);          // cap 3
-
-const BASE = (process.env.TWITTER_ACCOUNTS || '')
-  .split(',').map(s => s.trim()).filter(Boolean)
-  .filter(h => !PRIORITY.includes(h)).slice(0, Math.max(0, 5 - PRIORITY.length)); // total cap 5
-
-const PRIORITY_INTERVAL_MS = Math.max(60_000,  parseInt(process.env.PRIORITY_INTERVAL_MS || '60000', 10));   // >=60s
-const BASE_INTERVAL_MS     = Math.max(600_000, parseInt(process.env.BASE_INTERVAL_MS || '600000', 10));      // >=10m
-const PER_REQUEST_GAP_MS   = Math.max(10_000,  parseInt(process.env.PER_REQUEST_GAP_MS || '10000', 10));     // >=10s
-const BURST_WINDOW_MS      = Math.max(300_000, parseInt(process.env.BURST_WINDOW_MS || '300000', 10));       // >=5m
-const CREDIT_SUSPEND_THRESHOLD = Math.max(0, parseInt(process.env.CREDIT_SUSPEND_THRESHOLD || '2000', 10));  // heuristic
-const SUSPEND_COOLDOWN_MS  = Math.max(15*60_000, parseInt(process.env.SUSPEND_COOLDOWN_MS || '1800000', 10));// >=15m
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const DEBUG = /^true$/i.test(process.env.DEBUG_LOGS || 'false');
 
-// AI / OpenRouter
-const OPENROUTER_API_KEY   = process.env.OPENROUTER_API_KEY || '';
+const PRIORITY = (process.env.PRIORITY_ACCOUNTS || '')
+  .split(',').map(s => s.trim()).filter(Boolean).slice(0, 3); // cap 3
+const BASE = (process.env.TWITTER_ACCOUNTS || '')
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .filter(h => !PRIORITY.includes(h))
+  .slice(0, Math.max(0, 5 - PRIORITY.length)); // total cap 5
+
+const PRIORITY_INTERVAL_MS = Math.max(60_000,  parseInt(process.env.PRIORITY_INTERVAL_MS || '60000', 10));
+const BASE_INTERVAL_MS     = Math.max(600_000, parseInt(process.env.BASE_INTERVAL_MS || '600000', 10));
+const PER_REQUEST_GAP_MS   = Math.max(10_000,  parseInt(process.env.PER_REQUEST_GAP_MS || '10000', 10));
+const BURST_WINDOW_MS      = Math.max(300_000, parseInt(process.env.BURST_WINDOW_MS || '300000', 10));
+const CREDIT_SUSPEND_THRESHOLD = Math.max(0, parseInt(process.env.CREDIT_SUSPEND_THRESHOLD || '2000', 10));
+const SUSPEND_COOLDOWN_MS  = Math.max(15 * 60_000, parseInt(process.env.SUSPEND_COOLDOWN_MS || '1800000', 10));
+
 const AI_MODE              = process.env.AI_ENSEMBLE_MODE || 'adaptive';
 const ENSEMBLE_VOTING      = process.env.ENSEMBLE_VOTING || 'weighted';
 const CONFIDENCE_THRESHOLD = Math.min(1, Math.max(0, parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85')));
+const MODEL_PRIMARY        = process.env.PRIMARY_MODEL   || 'deepseek/deepseek-r1';
+const MODEL_SECONDARY      = process.env.SECONDARY_MODEL || 'anthropic/claude-3-haiku';
+const MODEL_PREMIUM        = process.env.PREMIUM_MODEL   || 'anthropic/claude-3.5-sonnet';
+const MODEL_BACKUP         = process.env.BACKUP_MODEL    || 'qwen/qwen-2.5-72b-instruct';
 
-const MODEL_PRIMARY   = process.env.PRIMARY_MODEL   || 'deepseek/deepseek-r1';
-const MODEL_SECONDARY = process.env.SECONDARY_MODEL || 'anthropic/claude-3-haiku';
-const MODEL_PREMIUM   = process.env.PREMIUM_MODEL   || 'anthropic/claude-3.5-sonnet';
-const MODEL_BACKUP    = process.env.BACKUP_MODEL    || 'qwen/qwen-2.5-72b-instruct';
+const MODE_DEFAULT         = (process.env.MODE_DEFAULT || 'paper_trading').trim();
 
 // ---------- HTTP clients ----------
 const twitterHttp = axios.create({
@@ -71,18 +69,20 @@ const openrouterHttp = axios.create({
 });
 
 // ---------- Monitor State ----------
-const lastSeenByHandle = {};             // handle -> last tweet id (string)
-const tweetsBuffer = [];                 // newest-first (for UI)
+const lastSeenByHandle = {};       // handle -> last tweet id (string)
+const tweetsBuffer = [];           // newest-first
 const MAX_TWEETS = 300;
 
 let priorityTimer = null;
 let baseTimer = null;
-const burstTimers = new Map();           // handle -> interval ref
-const burstUntil = {};                   // handle -> epoch ms
-let suspendedUntil = 0;                  // epoch ms when polling resumes
+const burstTimers = new Map();     // handle -> interval
+const burstUntil = {};             // handle -> epoch ms
+let suspendedUntil = 0;            // epoch ms when polling may resume
 let lastPollAtPriority = null;
 let lastPollAtBase = null;
 let isMonitoring = false;
+
+let CURRENT_MODE = MODE_DEFAULT;   // 'production' | 'simulation' | 'paper_trading'
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const dlog  = (...a) => { if (DEBUG) console.log('[DEBUG]', ...a); };
@@ -114,7 +114,7 @@ function previewTweet(t) {
   return s.length > 120 ? s.slice(0, 120) + '…' : s;
 }
 
-// ---------- Core fetch from TwitterAPI.io (REAL) ----------
+// ---------- Core fetch (TwitterAPI.io) ----------
 async function fetchLastTweets(handle) {
   try {
     const res = await twitterHttp.get('/twitter/user/last_tweets', {
@@ -128,7 +128,7 @@ async function fetchLastTweets(handle) {
   } catch (e) {
     const st = e?.response?.status;
 
-    // 402 Payment required -> suspend globally (protect credits)
+    // 402 Payment required -> suspend globally
     if (st === 402) {
       suspendedUntil = Date.now() + SUSPEND_COOLDOWN_MS;
       console.warn(`⚠️ 402 for @${handle}. Suspending all polling until ${new Date(suspendedUntil).toISOString()}`);
@@ -136,7 +136,7 @@ async function fetchLastTweets(handle) {
     }
     // 429 rate limit -> back off at account level
     if (st === 429) {
-      console.warn(`⏳ 429 rate limited on @${handle}. Backing off ${BASE_INTERVAL_MS}ms`);
+      console.warn(`⏳ 429 on @${handle}. Backing off ${BASE_INTERVAL_MS}ms`);
       await sleep(BASE_INTERVAL_MS);
       return [];
     }
@@ -147,7 +147,7 @@ async function fetchLastTweets(handle) {
   }
 }
 
-// ---------- Burst control (faster cadence after activity) ----------
+// ---------- Burst control ----------
 function ensureBurst(handle) {
   const now = Date.now();
   burstUntil[handle] = Math.max(burstUntil[handle] || 0, now + BURST_WINDOW_MS);
@@ -205,24 +205,33 @@ async function baseLoopOnce() {
   }
 }
 
-// ---------- Monitor control (MANUAL start/stop) ----------
+// ---------- Monitor control (manual) ----------
 async function startMonitoring() {
   if (isMonitoring) return { ok: true, message: 'already running' };
   if (!TWITTER_API_KEY || (PRIORITY.length + BASE.length) === 0) {
     return { ok: false, message: 'Missing TWITTER_API_KEY or accounts' };
   }
+
   console.log(
-    `🚀 Monitoring started. Priority=[${PRIORITY.join(', ')||'none'}] ${PRIORITY_INTERVAL_MS}ms  ` +
-    `Base=[${BASE.join(', ')||'none'}] ${BASE_INTERVAL_MS}ms  Gap=${PER_REQUEST_GAP_MS}ms  Burst=${BURST_WINDOW_MS}ms`
+    `🚀 Monitoring started. Mode=${CURRENT_MODE}. ` +
+    `Priority=[${PRIORITY.join(', ')||'none'}] ${PRIORITY_INTERVAL_MS}ms | ` +
+    `Base=[${BASE.join(', ')||'none'}] ${BASE_INTERVAL_MS}ms | Gap=${PER_REQUEST_GAP_MS}ms | Burst=${BURST_WINDOW_MS}ms`
   );
 
   isMonitoring = true;
-  // initial pass (non-blocking)
+
+  // kick off initial pass (non-blocking)
   priorityLoopOnce().catch(e => console.error('Priority init error:', e?.message || e));
   baseLoopOnce().catch(e => console.error('Base init error:', e?.message || e));
 
-  priorityTimer = setInterval(() => priorityLoopOnce().catch(e => console.error('Priority loop error:', e?.message || e)), PRIORITY_INTERVAL_MS);
-  baseTimer     = setInterval(() => baseLoopOnce().catch(e => console.error('Base loop error:', e?.message || e)), BASE_INTERVAL_MS);
+  priorityTimer = setInterval(
+    () => priorityLoopOnce().catch(e => console.error('Priority loop error:', e?.message || e)),
+    PRIORITY_INTERVAL_MS
+  );
+  baseTimer = setInterval(
+    () => baseLoopOnce().catch(e => console.error('Base loop error:', e?.message || e)),
+    BASE_INTERVAL_MS
+  );
 
   return { ok: true, message: 'started' };
 }
@@ -260,11 +269,9 @@ function monitorStatus() {
   };
 }
 
-// ---------- AI helpers (real OpenRouter calls if key present) ----------
+// ---------- AI helpers (OpenRouter) ----------
 async function openrouterChat(model, systemPrompt, userPrompt) {
-  if (!OPENROUTER_API_KEY) {
-    throw new Error('OPENROUTER_API_KEY missing');
-  }
+  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY missing');
   const res = await openrouterHttp.post('/chat/completions', {
     model,
     temperature: 0.3,
@@ -279,14 +286,14 @@ async function openrouterChat(model, systemPrompt, userPrompt) {
 // ---------- Routes ----------
 app.get('/', (_req, res) => res.send('MemesMachine API online'));
 
-// Platform status (for dashboard + diagnostics)
 app.get('/api/status', (_req, res) => {
   res.json({
     status: 'online',
     monitoring: isMonitoring,
     apiHealth: {
       openrouter: !!OPENROUTER_API_KEY,
-      database: true,     // you can wire your DB later; returning true keeps UI green
+      twitter: !!TWITTER_API_KEY,
+      database: true, // keep UI green; wire your DB later
     },
     stats: {
       totalInvested: 0,
@@ -303,6 +310,7 @@ app.get('/api/status', (_req, res) => {
       baseIntervalMs: BASE_INTERVAL_MS,
       gapMs: PER_REQUEST_GAP_MS,
       burstWindowMs: BURST_WINDOW_MS,
+      creditSuspendThreshold: CREDIT_SUSPEND_THRESHOLD,
     },
     ai: {
       mode: AI_MODE,
@@ -316,10 +324,11 @@ app.get('/api/status', (_req, res) => {
       },
       hasOpenRouter: !!OPENROUTER_API_KEY,
     },
+    mode: CURRENT_MODE,
   });
 });
 
-// ---- AI endpoints (REAL via OpenRouter if key is present)
+// AI endpoints (real if OPENROUTER_API_KEY present)
 app.get('/api/ai/ensemble', (_req, res) => {
   res.json({
     ok: true,
@@ -388,7 +397,7 @@ app.get('/api/ai/analyze', async (req, res) => {
   }
 });
 
-// ---- Twitter monitor endpoints (REAL)
+// Twitter monitor endpoints
 app.get('/api/twitter/monitor', (_req, res) => res.json(monitorStatus()));
 
 app.get('/api/tweets/recent', (req, res) => {
@@ -406,8 +415,7 @@ app.post('/api/monitor/stop', (_req, res) => {
   res.json(stopMonitoring());
 });
 
-// Optional: system mode (for your dashboard toggle)
-let CURRENT_MODE = 'paper_trading'; // default safe mode
+// System mode (for your dropdown)
 app.post('/api/mode', (req, res) => {
   const { mode } = req.body || {};
   if (!mode) return res.status(400).json({ ok: false, error: 'mode required' });
@@ -418,6 +426,6 @@ app.post('/api/mode', (req, res) => {
 // ---------- Start server ----------
 app.listen(PORT, () => {
   console.log(`✅ MemesMachine API listening on ${PORT}`);
-  console.log(`• Auto-start monitoring: OFF (use POST /api/monitor/start)`);
+  console.log('• Auto-start monitoring: OFF (use POST /api/monitor/start)');
   if (!TWITTER_API_KEY) console.warn('⚠️ TWITTER_API_KEY is missing — monitoring will refuse to start.');
 });
