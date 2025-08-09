@@ -62,10 +62,10 @@ class TwitterMonitor {
 
       if (!this.resolutionCache[handle]) {
         if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
-        const res = await resolveHandleToId(handle);
-        if (res.id) {
-          this.resolutionCache[handle] = res.id;
-          console.log(`🔎 Resolved @${handle} -> ${res.id} (${res.source})`);
+        const resolvedId = await resolveHandleToId(handle);           // << fixed
+        if (resolvedId) {
+          this.resolutionCache[handle] = resolvedId;
+          console.log(`🔎 Resolved @${handle} -> ${resolvedId}`);
         } else {
           console.warn(`⚠️ Could not resolve @${handle} to ID (will call by handle, may 404)`);
         }
