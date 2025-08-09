@@ -1,4 +1,4 @@
-// index.js — MemesMachine API (manual start, real TwitterAPI.io + OpenRouter if keys present)
+// index.js — MemesMachine API (manual start; Production + Simulation with real tweets via TwitterAPI.io)
 
 require('dotenv').config();
 const express = require('express');
@@ -29,11 +29,11 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const DEBUG = /^true$/i.test(process.env.DEBUG_LOGS || 'false');
 
 const PRIORITY = (process.env.PRIORITY_ACCOUNTS || '')
-  .split(',').map(s => s.trim()).filter(Boolean).slice(0, 3); // cap 3
+  .split(',').map(s => s.trim()).filter(Boolean).slice(0, 3);
 const BASE = (process.env.TWITTER_ACCOUNTS || '')
   .split(',').map(s => s.trim()).filter(Boolean)
   .filter(h => !PRIORITY.includes(h))
-  .slice(0, Math.max(0, 5 - PRIORITY.length)); // total cap 5
+  .slice(0, Math.max(0, 5 - PRIORITY.length));
 
 const PRIORITY_INTERVAL_MS = Math.max(60_000,  parseInt(process.env.PRIORITY_INTERVAL_MS || '60000', 10));
 const BASE_INTERVAL_MS     = Math.max(600_000, parseInt(process.env.BASE_INTERVAL_MS || '600000', 10));
@@ -50,7 +50,16 @@ const MODEL_SECONDARY      = process.env.SECONDARY_MODEL || 'anthropic/claude-3-
 const MODEL_PREMIUM        = process.env.PREMIUM_MODEL   || 'anthropic/claude-3.5-sonnet';
 const MODEL_BACKUP         = process.env.BACKUP_MODEL    || 'qwen/qwen-2.5-72b-instruct';
 
-const MODE_DEFAULT         = (process.env.MODE_DEFAULT || 'paper_trading').trim();
+const MODE_DEFAULT         = (process.env.MODE_DEFAULT || 'paper_trading').trim(); // production | simulation | paper_trading
+let CURRENT_MODE           = MODE_DEFAULT;
+
+// --- Simulation ENV ---
+const SIMULATION_ENABLED                = /^true$/i.test(process.env.SIMULATION_ENABLED || 'true');
+const SIMULATION_USE_REAL_TWEETS        = /^true$/i.test(process.env.SIMULATION_USE_REAL_TWEETS || 'true');
+const SIMULATION_LOOKBACK_MINUTES       = Math.max(15, parseInt(process.env.SIMULATION_LOOKBACK_MINUTES || '120', 10)); // min 15
+const SIMULATION_MAX_TWEETS_PER_CYCLE   = Math.max(1, parseInt(process.env.SIMULATION_MAX_TWEETS_PER_CYCLE || '4', 10));
+const SIMULATION_SPEED_MULTIPLIER       = Math.max(0.25, parseFloat(process.env.SIMULATION_SPEED_MULTIPLIER || '1')); // 1x default
+const SIMULATION_RANDOMIZE_START        = /^true$/i.test(process.env.SIMULATION_RANDOMIZE_START || 'true');
 
 // ---------- HTTP clients ----------
 const twitterHttp = axios.create({
@@ -69,25 +78,28 @@ const openrouterHttp = axios.create({
 });
 
 // ---------- Monitor State ----------
-const lastSeenByHandle = {};       // handle -> last tweet id (string)
-const tweetsBuffer = [];           // newest-first
+const lastSeenByHandle = {};       // handle -> last tweet id (string) for production/paper
+let lastPollAtPriority = null;
+let lastPollAtBase = null;
+
+const tweetsBuffer = [];           // newest-first (internal canonical form)
 const MAX_TWEETS = 300;
+
+let isMonitoring = false;
+let suspendedUntil = 0;
 
 let priorityTimer = null;
 let baseTimer = null;
-const burstTimers = new Map();     // handle -> interval
-const burstUntil = {};             // handle -> epoch ms
-let suspendedUntil = 0;            // epoch ms when polling may resume
-let lastPollAtPriority = null;
-let lastPollAtBase = null;
-let isMonitoring = false;
 
-let CURRENT_MODE = MODE_DEFAULT;   // 'production' | 'simulation' | 'paper_trading'
+// simulation timers/state
+let simTimer = null;
+const simQueues = new Map();       // handle -> { queue:[tweets oldest->newest], cursor:int }
+let simTickMs = 10_000;            // recalculated on start
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const dlog  = (...a) => { if (DEBUG) console.log('[DEBUG]', ...a); };
 
-// ---------- Tweet helpers ----------
+// ---------- Helpers: tweets ----------
 function normalizeTweets(raw, author) {
   return (raw || []).map(t => ({
     id: String(t.id ?? t.id_str ?? ''),
@@ -114,7 +126,7 @@ function previewTweet(t) {
   return s.length > 120 ? s.slice(0, 120) + '…' : s;
 }
 
-// ---------- Core fetch (TwitterAPI.io) ----------
+// ---------- TwitterAPI.io fetch (production/paper) ----------
 async function fetchLastTweets(handle) {
   try {
     const res = await twitterHttp.get('/twitter/user/last_tweets', {
@@ -127,15 +139,12 @@ async function fetchLastTweets(handle) {
     return fresh;
   } catch (e) {
     const st = e?.response?.status;
-
-    // 402 Payment required -> suspend globally
-    if (st === 402) {
-      suspendedUntil = Date.now() + SUSPEND_COOLDOWN_MS;
-      console.warn(`⚠️ 402 for @${handle}. Suspending all polling until ${new Date(suspendedUntil).toISOString()}`);
+    if (st === 402) { // Payment required — protect credits
+      suspendedUntil = Date.now() + Math.max(SUSPEND_COOLDOWN_MS, 15 * 60_000);
+      console.warn(`⚠️ 402 for @${handle}. Suspending polling until ${new Date(suspendedUntil).toISOString()}`);
       return [];
     }
-    // 429 rate limit -> back off at account level
-    if (st === 429) {
+    if (st === 429) { // Rate limit — soft backoff
       console.warn(`⏳ 429 on @${handle}. Backing off ${BASE_INTERVAL_MS}ms`);
       await sleep(BASE_INTERVAL_MS);
       return [];
@@ -147,7 +156,10 @@ async function fetchLastTweets(handle) {
   }
 }
 
-// ---------- Burst control ----------
+// ---------- Burst control (production/paper) ----------
+const burstTimers = new Map(); // handle -> interval id
+const burstUntil = {};         // handle -> epoch ms
+
 function ensureBurst(handle) {
   const now = Date.now();
   burstUntil[handle] = Math.max(burstUntil[handle] || 0, now + BURST_WINDOW_MS);
@@ -168,13 +180,13 @@ function ensureBurst(handle) {
       console.log(`🆕 ${first.created_at} @${handle} — ${fresh.length} new. First: ${previewTweet(first)}`);
       burstUntil[handle] = Date.now() + BURST_WINDOW_MS; // extend if busy
     }
-  }, Math.max(60_000, PRIORITY_INTERVAL_MS)); // burst ~60s+
+  }, Math.max(60_000, PRIORITY_INTERVAL_MS));
 
   burstTimers.set(handle, t);
   console.log(`⚡ Burst started for @${handle} (until ${new Date(burstUntil[handle]).toISOString()})`);
 }
 
-// ---------- Poll loops ----------
+// ---------- Production/Paper loops ----------
 async function priorityLoopOnce() {
   if (Date.now() < suspendedUntil) return;
   lastPollAtPriority = new Date().toISOString();
@@ -205,20 +217,136 @@ async function baseLoopOnce() {
   }
 }
 
-// ---------- Monitor control (manual) ----------
+// =====================================================================
+//                              SIMULATION
+// =====================================================================
+async function buildSimulationQueues() {
+  if (!SIMULATION_ENABLED) throw new Error('Simulation disabled via env');
+  if (SIMULATION_USE_REAL_TWEETS && !TWITTER_API_KEY) {
+    throw new Error('SIMULATION_USE_REAL_TWEETS requires TWITTER_API_KEY');
+  }
+
+  simQueues.clear();
+
+  const allHandles = [...PRIORITY, ...BASE];
+  if (allHandles.length === 0) {
+    console.warn('⚠️ No accounts configured for simulation.');
+    return;
+  }
+
+  console.log(`🎬 Building simulation queues for: ${allHandles.join(', ')}`);
+  for (let i = 0; i < allHandles.length; i++) {
+    const handle = allHandles[i];
+    if (i) await sleep(Math.min(PER_REQUEST_GAP_MS, 2000)); // lighter spacing on warmup
+
+    let tweets = [];
+    if (SIMULATION_USE_REAL_TWEETS) {
+      // fetch a single recent batch
+      const batch = await fetchLastTweets(handle);
+      tweets = batch.length ? batch : [];
+    }
+
+    // Normalize: oldest -> newest for replay order
+    tweets.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+    // Optional: randomize starting point (rotate array)
+    if (SIMULATION_RANDOMIZE_START && tweets.length > 3) {
+      const offset = Math.floor(Math.random() * Math.min(tweets.length, 6)); // keep believable
+      tweets = tweets.slice(offset).concat(tweets.slice(0, offset));
+    }
+
+    simQueues.set(handle, { queue: tweets, cursor: 0 });
+    console.log(`🎞 @${handle} simulation queue ready (${tweets.length} tweets)`);
+  }
+
+  // Base tick derived from priority interval but accelerated/slowable by multiplier
+  const baseTick = Math.max(3_000, Math.round(PRIORITY_INTERVAL_MS / SIMULATION_SPEED_MULTIPLIER));
+  // For UI smoothness don’t exceed 30s between visible updates in sim
+  simTickMs = Math.min(baseTick, 30_000);
+  console.log(`⏱  Simulation tick = ${simTickMs}ms, max emits/cycle=${SIMULATION_MAX_TWEETS_PER_CYCLE}, lookback=${SIMULATION_LOOKBACK_MINUTES}m`);
+}
+
+function simulationEmitCycle() {
+  if (!isMonitoring || CURRENT_MODE !== 'simulation') return;
+
+  const handles = [...simQueues.keys()];
+  if (!handles.length) return;
+
+  let emitted = 0;
+  // Round-robin across handles to keep feed varied
+  for (let r = 0; r < handles.length && emitted < SIMULATION_MAX_TWEETS_PER_CYCLE; r++) {
+    for (const h of handles) {
+      if (emitted >= SIMULATION_MAX_TWEETS_PER_CYCLE) break;
+      const st = simQueues.get(h);
+      if (!st || !st.queue.length) continue;
+
+      // roll cursor if beyond end
+      if (st.cursor >= st.queue.length) st.cursor = 0;
+
+      // Clone and re-stamp created_at to "now" to look live in feed
+      const src = st.queue[st.cursor];
+      st.cursor += 1;
+
+      if (!src) continue;
+      const emit = {
+        ...src,
+        created_at: new Date().toISOString(),
+        // keep id stable; if you prefer, suffix with cursor to ensure uniqueness
+        id: `${src.id}-${st.cursor}`, // avoid dedupe clashes on repeated cycles
+        _simulated: true,
+      };
+      pushTweets([emit]);
+      emitted += 1;
+    }
+  }
+
+  if (emitted > 0) {
+    const first = tweetsBuffer[0];
+    if (first) {
+      console.log(`🎧 Sim emit x${emitted} — latest: @${first.author} "${previewTweet(first)}"`);
+    }
+  }
+}
+
+// =====================================================================
+//                       Monitor control (manual)
+// =====================================================================
 async function startMonitoring() {
   if (isMonitoring) return { ok: true, message: 'already running' };
-  if (!TWITTER_API_KEY || (PRIORITY.length + BASE.length) === 0) {
-    return { ok: false, message: 'Missing TWITTER_API_KEY or accounts' };
+  if ((PRIORITY.length + BASE.length) === 0) {
+    return { ok: false, message: 'No accounts configured' };
   }
+
+  if (CURRENT_MODE === 'simulation') {
+    if (!SIMULATION_ENABLED) return { ok: false, message: 'Simulation disabled via env' };
+    // setup simulation
+    await buildSimulationQueues();
+    isMonitoring = true;
+
+    // clear any production timers just in case
+    if (priorityTimer) clearInterval(priorityTimer);
+    if (baseTimer) clearInterval(baseTimer);
+    for (const t of burstTimers.values()) clearInterval(t);
+    burstTimers.clear();
+
+    // start sim timer
+    if (simTimer) clearInterval(simTimer);
+    simTimer = setInterval(simulationEmitCycle, simTickMs);
+
+    console.log(`🚀 Simulation started. Mode=${CURRENT_MODE}. Accounts=[${[...simQueues.keys()].join(', ')||'none'}]`);
+    return { ok: true, message: 'simulation started' };
+  }
+
+  // production / paper_trading use real polling
+  if (!TWITTER_API_KEY) return { ok: false, message: 'Missing TWITTER_API_KEY' };
+
+  isMonitoring = true;
 
   console.log(
     `🚀 Monitoring started. Mode=${CURRENT_MODE}. ` +
     `Priority=[${PRIORITY.join(', ')||'none'}] ${PRIORITY_INTERVAL_MS}ms | ` +
     `Base=[${BASE.join(', ')||'none'}] ${BASE_INTERVAL_MS}ms | Gap=${PER_REQUEST_GAP_MS}ms | Burst=${BURST_WINDOW_MS}ms`
   );
-
-  isMonitoring = true;
 
   // kick off initial pass (non-blocking)
   priorityLoopOnce().catch(e => console.error('Priority init error:', e?.message || e));
@@ -233,6 +361,8 @@ async function startMonitoring() {
     BASE_INTERVAL_MS
   );
 
+  // ensure any previous sim is off
+  if (simTimer) clearInterval(simTimer);
   return { ok: true, message: 'started' };
 }
 
@@ -241,6 +371,7 @@ function stopMonitoring() {
   if (baseTimer) clearInterval(baseTimer);
   for (const t of burstTimers.values()) clearInterval(t);
   burstTimers.clear();
+  if (simTimer) clearInterval(simTimer);
   isMonitoring = false;
   console.log('🛑 Monitoring stopped.');
   return { ok: true, message: 'stopped' };
@@ -255,6 +386,7 @@ function monitorStatus() {
   return {
     ok: true,
     monitoring: isMonitoring,
+    mode: CURRENT_MODE,
     priorityAccounts: PRIORITY,
     baseAccounts: BASE,
     totalTweets: tweetsBuffer.length,
@@ -266,6 +398,14 @@ function monitorStatus() {
     burstWindowMs: BURST_WINDOW_MS,
     suspended: Date.now() < suspendedUntil,
     suspendedUntil: Date.now() < suspendedUntil ? new Date(suspendedUntil).toISOString() : null,
+    simulation: {
+      enabled: SIMULATION_ENABLED,
+      usingRealTweets: SIMULATION_USE_REAL_TWEETS,
+      tickMs: simTickMs,
+      maxPerCycle: SIMULATION_MAX_TWEETS_PER_CYCLE,
+      speedMultiplier: SIMULATION_SPEED_MULTIPLIER,
+      queues: [...simQueues.keys()],
+    },
   };
 }
 
@@ -293,7 +433,7 @@ app.get('/api/status', (_req, res) => {
     apiHealth: {
       openrouter: !!OPENROUTER_API_KEY,
       twitter: !!TWITTER_API_KEY,
-      database: true, // keep UI green; wire your DB later
+      database: true,
     },
     stats: {
       totalInvested: 0,
@@ -328,7 +468,7 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
-// AI endpoints (real if OPENROUTER_API_KEY present)
+// AI endpoints
 app.get('/api/ai/ensemble', (_req, res) => {
   res.json({
     ok: true,
@@ -397,12 +537,24 @@ app.get('/api/ai/analyze', async (req, res) => {
   }
 });
 
-// Twitter monitor endpoints
+// Monitor endpoints
 app.get('/api/twitter/monitor', (_req, res) => res.json(monitorStatus()));
 
 app.get('/api/tweets/recent', (req, res) => {
   const limit = parseInt(req.query.limit || '20', 10);
-  res.json({ tweets: getRecentTweets(limit) });
+  const raw = getRecentTweets(limit);
+
+  // Map to frontend-friendly shape: author, content, timestamp, url (+ keep analysis optional)
+  const mapped = raw.map(t => ({
+    id: t.id,
+    author: t.author,
+    content: t.text,
+    timestamp: t.created_at,
+    url: t.url,
+    // analysis omitted intentionally; your UI handles missing safely
+  }));
+
+  res.json({ tweets: mapped });
 });
 
 app.post('/api/monitor/start', async (_req, res) => {
@@ -415,17 +567,28 @@ app.post('/api/monitor/stop', (_req, res) => {
   res.json(stopMonitoring());
 });
 
-// System mode (for your dropdown)
-app.post('/api/mode', (req, res) => {
+// System mode toggle (used by your dropdown)
+app.post('/api/mode', async (req, res) => {
   const { mode } = req.body || {};
   if (!mode) return res.status(400).json({ ok: false, error: 'mode required' });
-  CURRENT_MODE = String(mode);
-  res.json({ ok: true, mode: CURRENT_MODE });
+  if (!['production', 'simulation', 'paper_trading'].includes(mode)) {
+    return res.status(400).json({ ok: false, error: 'invalid mode' });
+  }
+
+  const wasMonitoring = isMonitoring;
+  CURRENT_MODE = mode;
+
+  // Switching modes while running: stop timers; require explicit restart (protect credits)
+  if (wasMonitoring) {
+    stopMonitoring();
+  }
+  res.json({ ok: true, mode: CURRENT_MODE, note: 'If monitoring was running, it has been stopped. Call /api/monitor/start again.' });
 });
 
 // ---------- Start server ----------
 app.listen(PORT, () => {
   console.log(`✅ MemesMachine API listening on ${PORT}`);
   console.log('• Auto-start monitoring: OFF (use POST /api/monitor/start)');
-  if (!TWITTER_API_KEY) console.warn('⚠️ TWITTER_API_KEY is missing — monitoring will refuse to start.');
+  console.log(`• Default mode: ${CURRENT_MODE}`);
+  if (!TWITTER_API_KEY) console.warn('⚠️ TWITTER_API_KEY is missing — production/paper monitoring will refuse to start.');
 });
