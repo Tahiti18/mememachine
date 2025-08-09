@@ -1,67 +1,70 @@
 // services/twitterMonitor.js
 
-const { TwitterApi } = require('twitter-api-v2');
-const cron = require('node-cron');
-const dotenv = require('dotenv');
-dotenv.config();
+const axios = require("axios");
 
-const client = new TwitterApi(process.env.TWITTER_BEARER_TOKEN);
+const API_KEY = process.env.TWITTER_API_KEY;
+const ACCOUNTS = process.env.TWITTER_ACCOUNTS
+  ? process.env.TWITTER_ACCOUNTS.split(",").map(a => a.trim())
+  : [];
 
-const MONITOR_ACCOUNTS = [
-  { handle: 'elonmusk', id: '44196397' },
-  { handle: 'VitalikButerin', id: '295218981' },
-  { handle: 'michael_saylor', id: '244647486' },
-  { handle: 'justinsuntron', id: '132029397' },
-  { handle: 'cz_binance', id: '888659910' },
-  { handle: 'naval', id: '745273' },
-  { handle: 'APompliano', id: '361289499' },
-  { handle: 'balajis', id: '36653169' },
-  { handle: 'coinbureau', id: '1190836684856822773' },
-  { handle: 'WhalePanda', id: '14198485' }
-];
+if (!API_KEY) {
+  console.error("❌ No TWITTER_API_KEY found in environment variables.");
+  process.exit(1);
+}
 
-const lastSeenTweets = {};
+if (ACCOUNTS.length === 0) {
+  console.error("❌ No TWITTER_ACCOUNTS found in environment variables.");
+  process.exit(1);
+}
 
-async function fetchTweets(user) {
+// Function to fetch Twitter user ID from TwitterAPI.io
+async function getUserId(username) {
   try {
-    const tweets = await client.v2.userTimeline(user.id, {
-      max_results: 5,
-      'tweet.fields': 'created_at'
+    const response = await axios.get(`https://twitterapi.io/api/user/${username}`, {
+      headers: { Authorization: `Bearer ${API_KEY}` }
     });
 
-    if (!tweets.data || !tweets.data.data) return;
-
-    const newTweets = [];
-    for (const tweet of tweets.data.data) {
-      if (lastSeenTweets[user.id] && tweet.id === lastSeenTweets[user.id]) break;
-      newTweets.push(tweet);
-    }
-
-    if (newTweets.length > 0) {
-      lastSeenTweets[user.id] = newTweets[0].id;
-      for (const t of newTweets) {
-        console.log(`🆕 New tweet from ${user.handle}: ${t.text}`);
-      }
+    if (response.data && response.data.data && response.data.data.id) {
+      return response.data.data.id;
+    } else {
+      console.error(`⚠️ Could not get ID for ${username}`);
+      return null;
     }
   } catch (err) {
-    if (err.code === 404) {
-      console.warn(`⚠️ Account not found: ${user.handle}`);
-    } else if (err.code === 429) {
-      console.error(`⏳ Rate limit hit for ${user.handle}, backing off...`);
-    } else {
-      console.error(`❌ Error fetching tweets for ${user.handle}:`, err);
-    }
+    console.error(`❌ Error fetching ID for ${username}:`, err.response?.data || err.message);
+    return null;
   }
 }
 
-function startMonitoring() {
-  console.log(`🚀 Starting Twitter monitoring for ${MONITOR_ACCOUNTS.length} accounts...`);
+// Main monitoring start
+(async () => {
+  console.log(`🚀 Starting Twitter monitoring for ${ACCOUNTS.length} accounts...`);
 
-  cron.schedule('*/1 * * * *', () => {
-    MONITOR_ACCOUNTS.forEach(user => {
-      fetchTweets(user);
-    });
-  });
-}
+  const accountIds = {};
+  for (const username of ACCOUNTS) {
+    const id = await getUserId(username);
+    if (id) {
+      accountIds[username] = id;
+      console.log(`✅ ${username} -> ${id}`);
+    }
+  }
 
-module.exports = { startMonitoring };
+  if (Object.keys(accountIds).length === 0) {
+    console.error("❌ No valid accounts found. Exiting.");
+    process.exit(1);
+  }
+
+  // Here you’d start your tweet fetching loop
+  setInterval(async () => {
+    for (const [username, id] of Object.entries(accountIds)) {
+      try {
+        const tweets = await axios.get(`https://twitterapi.io/api/tweets/${id}`, {
+          headers: { Authorization: `Bearer ${API_KEY}` }
+        });
+        console.log(`📢 ${username}: ${tweets.data.data.length} tweets fetched`);
+      } catch (err) {
+        console.error(`❌ Error fetching tweets for ${username}:`, err.response?.data || err.message);
+      }
+    }
+  }, 60000); // every 60 sec
+})();
