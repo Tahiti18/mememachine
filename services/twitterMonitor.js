@@ -11,7 +11,14 @@ class TwitterMonitor {
     this.tweets = [];
     this.maxTweets = 100;
 
-    this.pollInterval = 60_000; // 1 minute
+    // --- intervals & pacing (env configurable) ---
+    const envPoll = parseInt(process.env.TWEET_CHECK_INTERVAL || '60000', 10);
+    this.pollInterval = Math.max(30000, isNaN(envPoll) ? 60000 : envPoll); // ≥30s, default 60s
+    const envGap = parseInt(process.env.PER_REQUEST_GAP_MS || '7000', 10);
+    this.perRequestGapMs = Math.max(5500, isNaN(envGap) ? 7000 : envGap);  // ≥5.5s, default 7s
+    const envRetry = parseInt(process.env.RETRY_BACKOFF_MS || `${this.pollInterval}`, 10);
+    this.retryBackoffMs = Math.max(this.perRequestGapMs, isNaN(envRetry) ? this.pollInterval : envRetry);
+
     this.intervalId = null;
     this.lastFetchTime = null;
 
@@ -19,7 +26,6 @@ class TwitterMonitor {
     this.rateLimitReset = null;
 
     this.lastSeenIdByUser = {}; // key: handleOrId -> since_id
-    this.perRequestGapMs = 5500; // free tier pacing
 
     // Default high-signal crypto list (handles). Override with TWITTER_ACCOUNTS
     const defaultHandles = [
@@ -145,8 +151,8 @@ class TwitterMonitor {
       } catch (err) {
         const status = err?.response?.status;
         if (status === 429) {
-          console.warn(`429 for ${key} — backing off 6s then retrying once`);
-          await new Promise(res => setTimeout(res, 6000));
+          console.warn(`429 for ${key} — backing off ${this.retryBackoffMs}ms then retrying once`);
+          await new Promise(res => setTimeout(res, this.retryBackoffMs));
           return await client.get(path, { params });
         }
         throw err;
