@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { resolveHandleToId } = require('./twitterUserResolver');
+const { resolveHandleToIdWithSource } = require('./twitterUserResolver');
 
 class TwitterMonitor {
   constructor(options = {}) {
@@ -8,6 +8,7 @@ class TwitterMonitor {
 
     this.monitoringAccounts = [];      // [{ id?: string, handle?: string, label: string }]
     this.resolutionCache = {};         // handle -> id
+    this.resolutionSource = {};        // handle -> source (e.g., local-map)
     this.isMonitoring = false;
     this.isFetching = false;
     this.tweets = [];
@@ -62,10 +63,11 @@ class TwitterMonitor {
 
       if (!this.resolutionCache[handle]) {
         if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
-        const resolvedId = await resolveHandleToId(handle);           // << fixed
+        const { id: resolvedId, source } = await resolveHandleToIdWithSource(handle);
         if (resolvedId) {
           this.resolutionCache[handle] = resolvedId;
-          console.log(`🔎 Resolved @${handle} -> ${resolvedId}`);
+          this.resolutionSource[handle] = source || 'local-map';
+          console.log(`🔎 Resolved @${handle} -> ${resolvedId} (${this.resolutionSource[handle]})`);
         } else {
           console.warn(`⚠️ Could not resolve @${handle} to ID (will call by handle, may 404)`);
         }
