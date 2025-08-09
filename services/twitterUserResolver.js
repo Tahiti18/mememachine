@@ -1,18 +1,21 @@
 const axios = require('axios');
 
-async function getUserIdByUsername(username) {
-    const apiKey = process.env.TWITTER_API_KEY;
-    const url = `https://api.twitter.com/2/users/by/username/${username}?user.fields=id`;
+const client = axios.create({
+  baseURL: 'https://api.twitterapi.io',
+  headers: { 'x-api-key': process.env.TWITTER_API_KEY },
+  timeout: 12000
+});
 
-    const res = await axios.get(url, {
-        headers: { Authorization: `Bearer ${apiKey}` }
-    });
-
-    if (!res.data.data || !res.data.data.id) {
-        throw new Error('User ID not found');
-    }
-
-    return res.data.data.id;
+async function resolveHandleToId(handle) {
+  const h = String(handle).replace(/^@/, '').toLowerCase();
+  try {
+    const r = await client.get('/tweets/search', { params: { q: `from:${h}`, limit: 1 } });
+    const t = (r?.data?.data || [])[0];
+    const id = t?.author_id || t?.user_id;
+    return id ? String(id) : null;
+  } catch (_) {
+    return null;
+  }
 }
 
-module.exports = { getUserIdByUsername };
+module.exports = { resolveHandleToId };   // <-- IMPORTANT
