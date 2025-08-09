@@ -1,119 +1,82 @@
 // index.js
-'use strict';
-require('dotenv').config();
+// Minimal API server wiring your twitterMonitor (function exports, not a class)
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-// === Services ===
-const TwitterMonitor = require('./services/twitterMonitor');
+// ⬇️ use the function API you exported
+const monitor = require('./services/twitterMonitor'); 
+// monitor = { startMonitoring, stopMonitoring, getRecentTweets, getStatus }
 
 const app = express();
-app.use(cors({ origin: '*' }));
+const PORT = process.env.PORT || 8080;
+
+app.use(cors());
 app.use(express.json());
 
-// ===== Monitor wiring =====
-const monitor = new TwitterMonitor({
-  apiKey: process.env.TWITTER_API_KEY
+// --- Health / status
+app.get('/api/status', (req, res) => {
+  const m = monitor.getStatus();
+  res.json({
+    status: 'online',
+    monitoring: m.monitoring,
+    apiHealth: { openrouter: true, database: true }, // simple placeholders
+    stats: {
+      totalInvested: 0,
+      tweetsAnalyzed: m.totalTweets,
+      tokensCreated: 0,
+      successRate: 0.0
+    },
+    monitor: m
+  });
 });
 
-const parseList = (s) =>
-  (s || '')
-    .split(',')
-    .map(v => v.trim())
-    .filter(Boolean);
-
-const ACCOUNTS = parseList(process.env.TWITTER_ACCOUNTS);
-const PRIORITY = parseList(process.env.PRIORITY_ACCOUNTS || process.env.PRIORITY_ACCOUNT);
-
-let systemMode = 'production';
-let autoStarted = false;
-
-async function maybeAutoStart() {
-  if (autoStarted) return;
-  const enabled = String(process.env.ENABLE_TWITTER_MONITORING || 'true').toLowerCase() === 'true';
-  if (!enabled) return;
-
-  try {
-    const list = [...new Set([...PRIORITY, ...ACCOUNTS])];
-    if (list.length) {
-      await monitor.start(list);
-    }
-    autoStarted = true;
-    console.log(`🚦 Monitoring started. Priority=${PRIORITY.join(',') || 'none'} Base=${ACCOUNTS.join(',') || 'none'}`);
-  } catch (e) {
-    console.error('❌ Auto-start error:', e?.message || e);
-  }
-}
-maybeAutoStart();
-
-// ===== Helpers for UI payloads =====
-function mapTweetsForUI(items = []) {
-  return items.map(t => ({
-    author: t.author || 'unknown',
-    content: t.text || t.content || '',
-    timestamp: t.created_at || t.timestamp || new Date().toISOString(),
-    analysis: t.analysis || { sentiment: 50, viral: 30, impact: 30, signal: 'PROCESSING' }
+// --- Tweets
+app.get('/api/tweets/recent', (req, res) => {
+  const limit = Number(req.query.limit || 20);
+  const tweets = monitor.getRecentTweets(limit).map(t => ({
+    id: t.id,
+    author: t.author,
+    content: t.text,
+    timestamp: t.created_at,
+    analysis: { sentiment: 0, viral: 0, impact: 0, signal: 'PROCESSING' }
   }));
-}
-
-function computeStats() {
-  const s = monitor.getStatistics ? monitor.getStatistics() : null;
-  return {
-    totalInvested: 0, // plug real value if you have it
-    tweetsAnalyzed: s?.totalTweets ?? 0,
-    tokensCreated: 0,
-    successRate: s && s.totalTweets ? (s.highSignalTweets || 0) / s.totalTweets : 0
-  };
-}
-
-// ===== API expected by your dashboard =====
-app.get('/api/status', async (_req, res) => {
-  try {
-    const st = monitor.getStatus ? monitor.getStatus() : { isMonitoring: false };
-    res.json({
-      status: 'online',
-      monitoring: !!st.isMonitoring,
-      apiHealth: { openrouter: true, database: true },
-      stats: computeStats()
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'status_failed', detail: String(e?.message || e) });
-  }
+  res.json({ tweets });
 });
 
-app.get('/api/tweets/recent', async (_req, res) => {
-  try {
-    const list = await (monitor.getRecentTweets ? monitor.getRecentTweets(20) : []);
-    res.json({ tweets: mapTweetsForUI(list) });
-  } catch (e) {
-    res.status(500).json({ error: 'tweets_failed', detail: String(e?.message || e) });
-  }
-});
-
+// --- Control endpoints (used by the dashboard buttons)
 app.post('/api/monitor/start', async (req, res) => {
   try {
-    const fromBody = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
-    const list = parseList(fromBody.join(',')) || [...new Set([...PRIORITY, ...ACCOUNTS])];
-    await monitor.start(list);
-    res.json({ ok: true, monitoring: true, accounts: list });
+    const result = await monitor.startMonitoring();
+    res.json(result);
   } catch (e) {
-    res.status(500).json({ error: 'start_failed', detail: String(e?.message || e) });
+    res.status(500).json({ ok: false, message: e?.message || 'start failed' });
   }
 });
 
+app.post('/api/monitor/stop', (req, res) => {
+  try {
+    const result = monitor.stopMonitoring();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e?.message || 'stop failed' });
+  }
+});
+
+// --- Optional: switch modes (dashboard dropdown)
 app.post('/api/mode', (req, res) => {
-  const mode = String(req.body?.mode || '').toLowerCase();
-  if (!['production', 'simulation', 'paper_trading'].includes(mode)) {
-    return res.status(400).json({ error: 'bad_mode' });
-  }
-  systemMode = mode;
-  res.json({ ok: true, mode: systemMode });
+  const { mode } = req.body || {};
+  // No-op for now, but keep endpoint so UI doesn't error
+  res.json({ ok: true, mode: mode || 'production' });
 });
 
-// health + root
-app.get('/', (_req, res) => res.send('MemesMachine API online'));
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// --- Boot
+app.listen(PORT, async () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  // Auto-start monitoring on boot if enabled
+  if (String(process.env.ENABLE_TWITTER_MONITORING || 'true').toLowerCase() === 'true') {
+    const r = await monitor.startMonitoring();
+    console.log(`🚀 Monitoring start: ${r.ok ? 'OK' : 'FAIL'} — ${r.message}`);
+  }
+});
