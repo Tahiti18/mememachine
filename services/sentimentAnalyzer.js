@@ -2,224 +2,370 @@ class SentimentAnalyzer {
   constructor(aiEnsemble) {
     this.aiEnsemble = aiEnsemble;
     this.cache = new Map();
-    this.cacheTimeout = 5 * 60 * 1000; // 5 minutes
+    this.cacheTimeout = 300000; // 5 minutes
+    this.analysisHistory = [];
+    this.maxHistorySize = 1000;
   }
 
-  async analyzeTweet(tweetData) {
-    const { content, author, metadata = {} } = tweetData;
-
-    // Check cache first
-    const cacheKey = this.generateCacheKey(content, author);
-    const cached = this.cache.get(cacheKey);
-
-    if (cached && (Date.now() - cached.timestamp) < this.cacheTimeout) {
-      console.log('📋 Using cached analysis');
-      return cached.analysis;
-    }
-
+  // Main analyze method that index.js calls
+  async analyze(text) {
     try {
-      // Create analysis prompt
-      const prompt = this.createAnalysisPrompt(content, author, metadata);
-      const context = { author, content, metadata };
+      if (!text || typeof text !== 'string') {
+        throw new Error('Invalid text input for sentiment analysis');
+      }
 
-      console.log(`🔍 Analyzing tweet from @${author}: "${content.substring(0, 50)}..."`);
+      // Check cache first
+      const cacheKey = this.generateCacheKey(text);
+      const cached = this.getFromCache(cacheKey);
+      if (cached) {
+        console.log('Returning cached sentiment analysis');
+        return cached;
+      }
 
-      // Use AI ensemble for analysis
-      const rawAnalysis = await this.aiEnsemble.analyzeWithEnsemble(prompt, context);
-
-      // Post-process and enhance the analysis
-      const enhancedAnalysis = this.enhanceAnalysis(rawAnalysis, tweetData);
-
+      // Perform analysis using AI ensemble
+      const analysis = await this.aiEnsemble.analyze(text, 'sentiment');
+      
+      // Enhance with additional sentiment metrics
+      const enhancedAnalysis = this.enhanceAnalysis(analysis, text);
+      
       // Cache the result
-      this.cache.set(cacheKey, {
-        analysis: enhancedAnalysis,
-        timestamp: Date.now()
-      });
-
-      // Clean old cache entries
-      this.cleanCache();
-
+      this.setCache(cacheKey, enhancedAnalysis);
+      
+      // Add to history
+      this.addToHistory(text, enhancedAnalysis);
+      
       return enhancedAnalysis;
-
     } catch (error) {
-      console.error('Sentiment analysis error:', error);
-
-      // Return fallback analysis
-      return this.getFallbackAnalysis(tweetData);
+      console.error('Sentiment analysis failed:', error);
+      return this.getFallbackAnalysis(text);
     }
   }
 
-  createAnalysisPrompt(content, author, metadata) {
-    return `Analyze this tweet for cryptocurrency sentiment and market impact:
+  // Method specifically for tweet analysis
+  async analyzeTweet(tweetData) {
+    try {
+      const text = tweetData.content || tweetData.text || '';
+      const author = tweetData.author || 'unknown';
+      const metadata = tweetData.metadata || {};
 
-TWEET: "${content}"
-AUTHOR: @${author}
-CONTEXT: ${this.getAuthorContext(author)}
-
-Please provide a JSON response with these exact fields:
-{
-  "sentiment": <number 1-100, where 100 is extremely bullish>,
-  "viral": <number 1-100, likelihood of going viral>,
-  "impact": <number 1-100, potential market impact>,
-  "confidence": <number 0.0-1.0, your confidence in this analysis>,
-  "keywords": ["key", "crypto", "terms", "found"],
-  "category": "<one of: price_prediction, tech_announcement, general_crypto, non_crypto>",
-  "urgency": "<one of: low, medium, high, critical>",
-  "reasoning": "Brief explanation of your analysis"
-}
-
-Consider:
-- Author's influence in crypto space
-- Tweet content and language sentiment
-- Timing and market context
-- Potential for creating FOMO or FUD
-- Historical impact of similar tweets`;
-  }
-
-  getAuthorContext(author) {
-    const contexts = {
-      elonmusk: "Tesla CEO, major crypto influencer, moves markets with tweets",
-      VitalikButerin: "Ethereum founder, technical authority, highly respected",
-      michael_saylor: "MicroStrategy CEO, Bitcoin advocate, institutional voice",
-      cathiedwood: "ARK Invest CEO, innovation investor",
-      satoshi_nakamoto: "Bitcoin creator (likely inactive)",
-      justinsuntron: "Tron founder, controversial figure",
-      cz_binance: "Former Binance CEO, major exchange influence"
-    };
-
-    return contexts[author] || "Crypto community member";
-  }
-
-  enhanceAnalysis(rawAnalysis, tweetData) {
-    const enhanced = {
-      ...rawAnalysis,
-      timestamp: new Date().toISOString(),
-      tweetData: {
-        content: tweetData.content,
-        author: tweetData.author,
-        length: tweetData.content.length
+      if (!text) {
+        throw new Error('Tweet content is required');
       }
+
+      console.log(`Analyzing tweet from @${author}: "${text.substring(0, 50)}..."`);
+
+      // Get base sentiment analysis
+      const baseAnalysis = await this.analyze(text);
+      
+      // Add Twitter-specific enhancements
+      const tweetAnalysis = {
+        ...baseAnalysis,
+        author,
+        tweetLength: text.length,
+        hasHashtags: text.includes('#'),
+        hasMentions: text.includes('@'),
+        hasLinks: text.includes('http'),
+        estimatedReach: this.estimateReach(author, text),
+        viralPotential: this.calculateViralPotential(text, author),
+        marketImpact: this.estimateMarketImpact(text, author, baseAnalysis.sentiment),
+        timestamp: new Date().toISOString(),
+        metadata
+      };
+
+      return tweetAnalysis;
+    } catch (error) {
+      console.error('Tweet analysis failed:', error);
+      return this.getFallbackTweetAnalysis(tweetData);
+    }
+  }
+
+  enhanceAnalysis(baseAnalysis, text) {
+    try {
+      return {
+        ...baseAnalysis,
+        textLength: text.length,
+        wordCount: text.split(/\s+/).length,
+        sentiment: this.normalizeSentiment(baseAnalysis.sentiment),
+        viral: this.normalizeScore(baseAnalysis.viral),
+        impact: this.normalizeScore(baseAnalysis.impact),
+        confidence: this.normalizeScore(baseAnalysis.confidence),
+        signal: this.determineSignal(baseAnalysis),
+        keywords: this.extractKeywords(text),
+        emotions: this.detectEmotions(text),
+        urgency: this.detectUrgency(text),
+        credibility: this.assessCredibility(text),
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      console.error('Analysis enhancement failed:', error);
+      return baseAnalysis;
+    }
+  }
+
+  normalizeSentiment(sentiment) {
+    if (typeof sentiment !== 'number') return 50;
+    return Math.max(0, Math.min(100, sentiment));
+  }
+
+  normalizeScore(score) {
+    if (typeof score !== 'number') return 50;
+    return Math.max(0, Math.min(100, score));
+  }
+
+  determineSignal(analysis) {
+    const avgScore = (analysis.sentiment + analysis.viral + analysis.impact) / 3;
+    if (avgScore >= 85) return 'HIGH';
+    if (avgScore >= 70) return 'MEDIUM';
+    if (avgScore >= 50) return 'LOW';
+    return 'PROCESSING';
+  }
+
+  extractKeywords(text) {
+    const keywords = [];
+    const cryptoTerms = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'blockchain', 'defi', 'nft', 'token', 'coin', 'moon', 'hodl', 'diamond', 'hands'];
+    const lowerText = text.toLowerCase();
+    
+    cryptoTerms.forEach(term => {
+      if (lowerText.includes(term)) {
+        keywords.push(term);
+      }
+    });
+    
+    return keywords;
+  }
+
+  detectEmotions(text) {
+    const emotions = {
+      excitement: 0,
+      fear: 0,
+      greed: 0,
+      optimism: 0,
+      skepticism: 0
     };
 
-    // Add signal strength
-    enhanced.signal = this.calculateSignalStrength(enhanced);
+    const lowerText = text.toLowerCase();
+    
+    // Excitement indicators
+    if (lowerText.includes('moon') || lowerText.includes('🚀') || lowerText.includes('incredible')) emotions.excitement += 30;
+    if (text.includes('!')) emotions.excitement += 10;
+    
+    // Fear indicators  
+    if (lowerText.includes('crash') || lowerText.includes('dump') || lowerText.includes('bear')) emotions.fear += 30;
+    
+    // Greed indicators
+    if (lowerText.includes('buy') || lowerText.includes('profit') || lowerText.includes('gains')) emotions.greed += 20;
+    
+    // Optimism indicators
+    if (lowerText.includes('future') || lowerText.includes('revolutionary') || lowerText.includes('potential')) emotions.optimism += 25;
+    
+    // Skepticism indicators
+    if (lowerText.includes('doubt') || lowerText.includes('scam') || lowerText.includes('careful')) emotions.skepticism += 20;
 
-    // Add market timing context
-    enhanced.marketContext = this.getMarketContext();
-
-    // Add author influence multiplier
-    enhanced.authorInfluence = this.getAuthorInfluence(tweetData.author);
-
-    // Adjust scores based on context
-    enhanced.adjustedScores = this.adjustScoresForContext(enhanced);
-
-    return enhanced;
+    return emotions;
   }
 
-  calculateSignalStrength(analysis) {
-    const sentiment = analysis.sentiment || 50;
-    const viral = analysis.viral || 30;
-    const impact = analysis.impact || 40;
-    const confidence = analysis.confidence || 0.5;
-
-    const score = (sentiment + viral + impact) / 3 * confidence;
-
-    if (score >= 80) return 'HIGH';
-    if (score >= 60) return 'MEDIUM';
-    if (score >= 40) return 'LOW';
-    return 'FILTERED';
+  detectUrgency(text) {
+    const urgencyWords = ['now', 'urgent', 'quickly', 'immediately', 'breaking', 'alert'];
+    const lowerText = text.toLowerCase();
+    let urgencyScore = 0;
+    
+    urgencyWords.forEach(word => {
+      if (lowerText.includes(word)) urgencyScore += 15;
+    });
+    
+    if (text.includes('!')) urgencyScore += 5;
+    if (text.match(/[!]{2,}/)) urgencyScore += 10;
+    
+    return Math.min(100, urgencyScore);
   }
 
-  getMarketContext() {
-    const now = new Date();
-    const hour = now.getHours();
-    const day = now.getDay();
+  assessCredibility(text) {
+    let credibilityScore = 50; // Base score
+    
+    // Positive indicators
+    if (text.length > 50 && text.length < 200) credibilityScore += 10; // Good length
+    if (text.includes('data') || text.includes('research')) credibilityScore += 15;
+    if (text.match(/\d+%/)) credibilityScore += 10; // Contains percentages
+    
+    // Negative indicators
+    if (text.match(/[!]{3,}/)) credibilityScore -= 15; // Too many exclamations
+    if (text.includes('guaranteed') || text.includes('100%')) credibilityScore -= 10;
+    if (text.toLowerCase().includes('trust me')) credibilityScore -= 20;
+    
+    return Math.max(0, Math.min(100, credibilityScore));
+  }
 
+  estimateReach(author, text) {
+    // Simplified reach estimation based on author and content
+    const baseReach = 1000; // Base reach for unknown authors
+    
+    // Author influence multipliers
+    const influencers = {
+      'elonmusk': 100000,
+      'vitalikbuterin': 50000,
+      'michael_saylor': 30000,
+      'cz_binance': 40000,
+      'justinsuntron': 25000
+    };
+    
+    const authorReach = influencers[author.toLowerCase()] || baseReach;
+    
+    // Content multipliers
+    let multiplier = 1;
+    if (text.includes('bitcoin') || text.includes('ethereum')) multiplier *= 1.5;
+    if (text.includes('🚀') || text.includes('moon')) multiplier *= 1.3;
+    if (text.length > 100 && text.length < 200) multiplier *= 1.2;
+    
+    return Math.floor(authorReach * multiplier);
+  }
+
+  calculateViralPotential(text, author) {
+    let viralScore = 30; // Base score
+    
+    // Author influence
+    const topInfluencers = ['elonmusk', 'vitalikbuterin', 'michael_saylor'];
+    if (topInfluencers.includes(author.toLowerCase())) viralScore += 40;
+    
+    // Content factors
+    if (text.includes('🚀')) viralScore += 15;
+    if (text.includes('#')) viralScore += 10;
+    if (text.includes('@')) viralScore += 5;
+    if (text.match(/\b(moon|diamond|hands|hodl)\b/i)) viralScore += 20;
+    
+    // Length factor
+    if (text.length >= 50 && text.length <= 200) viralScore += 10;
+    
+    return Math.min(100, viralScore);
+  }
+
+  estimateMarketImpact(text, author, sentiment) {
+    let impactScore = 20; // Base score
+    
+    // Author weight
+    const marketMovers = {
+      'elonmusk': 50,
+      'michael_saylor': 35,
+      'vitalikbuterin': 30,
+      'cz_binance': 25
+    };
+    
+    impactScore += marketMovers[author.toLowerCase()] || 5;
+    
+    // Sentiment influence
+    if (sentiment > 80) impactScore += 20;
+    else if (sentiment < 30) impactScore += 15; // Negative news can also move markets
+    
+    // Content impact
+    const marketTerms = ['bitcoin', 'btc', 'ethereum', 'crypto', 'investment', 'buy', 'sell'];
+    marketTerms.forEach(term => {
+      if (text.toLowerCase().includes(term)) impactScore += 8;
+    });
+    
+    return Math.min(100, impactScore);
+  }
+
+  generateCacheKey(text) {
+    // Simple hash function for cache key
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      const char = text.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString();
+  }
+
+  getFromCache(key) {
+    const cached = this.cache.get(key);
+    if (cached && (Date.now() - cached.timestamp) < this.cacheTimeout) {
+      return cached.data;
+    }
+    if (cached) {
+      this.cache.delete(key); // Remove expired cache
+    }
+    return null;
+  }
+
+  setCache(key, data) {
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now()
+    });
+    
+    // Clean old cache entries if cache gets too large
+    if (this.cache.size > 1000) {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+    }
+  }
+
+  addToHistory(text, analysis) {
+    this.analysisHistory.push({
+      text: text.substring(0, 100), // Store only first 100 chars
+      analysis,
+      timestamp: Date.now()
+    });
+    
+    // Keep history size manageable
+    if (this.analysisHistory.length > this.maxHistorySize) {
+      this.analysisHistory.shift();
+    }
+  }
+
+  getFallbackAnalysis(text) {
+    console.log('Using fallback sentiment analysis');
     return {
-      isMarketHours: day >= 1 && day <= 5 && hour >= 9 && hour <= 16,
-      timeZone: 'EST',
-      dayOfWeek: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day],
-      hour: hour
-    };
-  }
-
-  getAuthorInfluence(author) {
-    const influences = {
-      elonmusk: 1.5,          // 50% boost
-      VitalikButerin: 1.3,    // 30% boost  
-      michael_saylor: 1.2,    // 20% boost
-      cathiedwood: 1.1,       // 10% boost
-    };
-
-    return influences[author] || 1.0;
-  }
-
-  adjustScoresForContext(analysis) {
-    const base = {
-      sentiment: analysis.sentiment || 50,
-      viral: analysis.viral || 30,
-      impact: analysis.impact || 40
-    };
-
-    const influence = analysis.authorInfluence || 1.0;
-    const isMarketHours = analysis.marketContext?.isMarketHours || false;
-
-    return {
-      sentiment: Math.min(100, base.sentiment * influence),
-      viral: Math.min(100, base.viral * influence * (isMarketHours ? 1.1 : 1.0)),
-      impact: Math.min(100, base.impact * influence * (isMarketHours ? 1.2 : 1.0))
-    };
-  }
-
-  getFallbackAnalysis(tweetData) {
-    console.log('🔄 Using fallback sentiment analysis');
-
-    const content = tweetData.content.toLowerCase();
-
-    // Simple keyword-based analysis
-    const bullishWords = ['bullish', 'moon', 'rocket', 'up', 'gain', 'profit', 'buy', 'hodl'];
-    const bearishWords = ['bearish', 'crash', 'down', 'loss', 'sell', 'dump', 'fear'];
-    const cryptoWords = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'blockchain', 'defi'];
-
-    const bullishCount = bullishWords.filter(word => content.includes(word)).length;
-    const bearishCount = bearishWords.filter(word => content.includes(word)).length;
-    const cryptoCount = cryptoWords.filter(word => content.includes(word)).length;
-
-    const sentiment = Math.max(10, Math.min(90, 50 + (bullishCount - bearishCount) * 10));
-    const viral = Math.max(10, Math.min(90, 20 + cryptoCount * 10));
-    const impact = Math.max(10, Math.min(90, (sentiment + viral) / 2));
-
-    return {
-      sentiment,
-      viral,
-      impact,
-      confidence: 0.4,
-      signal: impact >= 60 ? 'MEDIUM' : 'LOW',
+      sentiment: 50,
+      viral: 30,
+      impact: 40,
+      confidence: 25,
+      signal: 'PROCESSING',
+      keywords: this.extractKeywords(text),
+      emotions: this.detectEmotions(text),
+      urgency: this.detectUrgency(text),
+      credibility: this.assessCredibility(text),
       fallback: true,
       timestamp: new Date().toISOString()
     };
   }
 
-  generateCacheKey(content, author) {
-    // Simple hash function for cache key
-    return `${author}_${content.substring(0, 50)}_${content.length}`;
-  }
-
-  cleanCache() {
-    const now = Date.now();
-    for (const [key, value] of this.cache.entries()) {
-      if (now - value.timestamp > this.cacheTimeout) {
-        this.cache.delete(key);
-      }
-    }
-  }
-
-  getCacheStats() {
+  getFallbackTweetAnalysis(tweetData) {
+    const text = tweetData.content || tweetData.text || '';
+    const author = tweetData.author || 'unknown';
+    
     return {
-      size: this.cache.size,
-      timeout: this.cacheTimeout,
-      oldestEntry: Math.min(...Array.from(this.cache.values()).map(v => v.timestamp))
+      ...this.getFallbackAnalysis(text),
+      author,
+      tweetLength: text.length,
+      hasHashtags: text.includes('#'),
+      hasMentions: text.includes('@'),
+      hasLinks: text.includes('http'),
+      estimatedReach: this.estimateReach(author, text),
+      viralPotential: this.calculateViralPotential(text, author),
+      marketImpact: this.estimateMarketImpact(text, author, 50),
+      metadata: tweetData.metadata || {}
     };
+  }
+
+  getStats() {
+    return {
+      totalAnalyses: this.analysisHistory.length,
+      cacheSize: this.cache.size,
+      averageSentiment: this.analysisHistory.length > 0 
+        ? this.analysisHistory.reduce((sum, item) => sum + item.analysis.sentiment, 0) / this.analysisHistory.length 
+        : 0,
+      recentAnalyses: this.analysisHistory.slice(-10)
+    };
+  }
+
+  clearCache() {
+    this.cache.clear();
+    console.log('Sentiment analyzer cache cleared');
+  }
+
+  clearHistory() {
+    this.analysisHistory = [];
+    console.log('Analysis history cleared');
   }
 }
 
