@@ -7,7 +7,7 @@ class TwitterMonitor {
 
     this.monitoringAccounts = [];
     this.isMonitoring = false;
-    this.isFetching = false; // re-entrancy guard
+    this.isFetching = false;
     this.tweets = [];
     this.maxTweets = 100;
 
@@ -18,8 +18,17 @@ class TwitterMonitor {
     this.rateLimitRemaining = 100;
     this.rateLimitReset = null;
 
-    // Track last seen tweet per username to fetch only new items
     this.lastSeenIdByUser = {};
+
+    // ✅ AUTO-START on deploy
+    if (this.apiKey) {
+      console.log('🚀 Auto-starting Twitter monitoring...');
+      this.start(['elonmusk', 'VitalikButerin', 'michael_saylor'])
+        .then(() => console.log('✅ Twitter monitoring started automatically'))
+        .catch(err => console.error('❌ Failed to auto-start monitoring:', err.message));
+    } else {
+      console.warn('⚠️ No TwitterAPI.io key found — monitoring not started.');
+    }
   }
 
   async start(accounts = ['elonmusk', 'VitalikButerin', 'michael_saylor']) {
@@ -33,17 +42,15 @@ class TwitterMonitor {
     this.monitoringAccounts = accounts;
     this.isMonitoring = true;
 
-    // Initial fetch
     await this.fetchLatestTweets();
 
-    // Polling loop (guard against overlaps)
     this.intervalId = setInterval(async () => {
       try {
         if (!this.isFetching) {
           await this.fetchLatestTweets();
         }
       } catch {
-        // swallow interval errors; logging already handled
+        // errors are already logged
       }
     }, this.pollInterval);
 
@@ -81,11 +88,10 @@ class TwitterMonitor {
           const userTweets = await this.fetchUserTweets(account);
           newTweets.push(...userTweets);
         } catch {
-          // already logged inside fetchUserTweets
+          // already logged
         }
       }
 
-      // Sort newest first, then process
       newTweets.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
       for (const tweet of newTweets) {
@@ -99,9 +105,6 @@ class TwitterMonitor {
     }
   }
 
-  /**
-   * Fetches the latest tweets for a username via TwitterAPI.io
-   */
   async fetchUserTweets(username) {
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
@@ -233,7 +236,6 @@ class TwitterMonitor {
       timestamp: new Date().toISOString(),
       priority: type === 'HIGH_IMPACT' ? 'critical' : 'high'
     };
-    // TODO: emit webhook / persist in DB / notify pipeline
     return alertData;
   }
 
