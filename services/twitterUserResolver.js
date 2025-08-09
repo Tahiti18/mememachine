@@ -1,5 +1,5 @@
-// Hard-coded numeric IDs for your core influencer list.
-// Returns an object { id, source } so logs can show "(local-map)" clearly.
+// Hard-coded numeric IDs for your current influencer list.
+// Source: stable, public IDs that don't change when handles change.
 
 const handleToIdMap = {
   elonmusk:       '44196397',
@@ -14,10 +14,17 @@ const handleToIdMap = {
   WhalePanda:     '14198485'
 };
 
-async function resolveHandleToId(handleRaw) {
+// Returns: { id: string|null, source: 'local-map' }
+async function resolveHandleToIdWithSource(handleRaw) {
   const h = String(handleRaw).replace(/^@/, '').toLowerCase();
   const id = handleToIdMap[h] || null;
-  return id ? { id, source: 'local-map' } : { id: null, source: 'none' };
+  return { id, source: 'local-map' };
 }
 
-module.exports = { resolveHandleToId };
+// Backward-compatible helper (string or null)
+async function resolveHandleToId(handleRaw) {
+  const { id } = await resolveHandleToIdWithSource(handleRaw);
+  return id;
+}
+
+module.exports = { resolveHandleToId, resolveHandleToIdWithSource };
