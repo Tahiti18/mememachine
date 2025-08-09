@@ -1,4 +1,4 @@
-// index.js — single file that wires the server, Twitter monitor routes, and AI routes
+// index.js — server + Twitter monitor routes + AI routes (NO auto-start)
 
 require('dotenv').config();
 const express = require('express');
@@ -10,8 +10,12 @@ const rateLimit = require('express-rate-limit');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 
-const { startMonitoring, stopMonitoring, getRecentTweets, getStatus: getTwStatus } =
-  require('./services/twitterMonitor');
+const {
+  startMonitoring,
+  stopMonitoring,
+  getRecentTweets,
+  getStatus: getTwStatus,
+} = require('./services/twitterMonitor');
 
 const app = express();
 
@@ -30,8 +34,8 @@ app.use(
   })
 );
 
-// ---------- tiny helpers ----------
-const has = (v) => typeof v === 'string' ? v.trim().length > 0 : !!v;
+// ---------- helpers ----------
+const has = (v) => (typeof v === 'string' ? v.trim().length > 0 : !!v);
 const ok = (res, data) => res.json(data);
 const err = (res, code, message) => res.status(code).json({ ok: false, error: message });
 
@@ -43,10 +47,11 @@ app.get('/', (_req, res) => {
 app.get('/api/status', (_req, res) => {
   ok(res, {
     status: 'online',
-    monitoring: true,
+    // NOTE: we no longer assume monitoring is running; reflect current state from /api/twitter/monitor
+    monitoring: getTwStatus().monitoring === true,
     apiHealth: {
       openrouter: has(process.env.OPENROUTER_API_KEY),
-      database: true, // no external DB right now; server is alive
+      database: true,
     },
     stats: {
       totalInvested: 0,
@@ -57,7 +62,7 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
-// ---------- Twitter monitor endpoints ----------
+// ---------- Twitter monitor endpoints (manual control) ----------
 app.post('/api/monitor/start', async (_req, res) => {
   try {
     const out = await startMonitoring();
@@ -83,7 +88,7 @@ app.get('/api/tweets/recent', (req, res) => {
 
 app.get('/api/twitter/monitor', (_req, res) => ok(res, getTwStatus()));
 
-// ---------- AI routes (fixes your 404s) ----------
+// ---------- AI routes ----------
 const OR_KEY = process.env.OPENROUTER_API_KEY || '';
 const PRIMARY_MODEL = process.env.PRIMARY_MODEL || 'anthropic/claude-3-haiku';
 const SECONDARY_MODEL = process.env.SECONDARY_MODEL || 'anthropic/claude-3-haiku';
@@ -186,7 +191,6 @@ app.get('/api/ai/analyze', async (req, res) => {
 
   try {
     let out = await openRouterChat(prompt, SECONDARY_MODEL);
-    // try to parse JSON; if not, fallback wrap
     let json;
     try {
       json = JSON.parse(out);
@@ -201,12 +205,7 @@ app.get('/api/ai/analyze', async (req, res) => {
 
 // ---------- boot ----------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  // auto-start monitor on boot so the dashboard shows ACTIVE
-  try {
-    await startMonitoring();
-  } catch (e) {
-    console.warn('Twitter monitor did not auto-start:', e?.message || e);
-  }
+  // IMPORTANT: NO auto-start here. Use /api/monitor/start from the UI button.
 });
