@@ -4,6 +4,8 @@ const axios = require('axios');
 const WebSocket = require('ws');
 
 const app = express();
+const resolveRoute = require('./monitoring/resolve');
+app.use(resolveRoute);
 const PORT = process.env.PORT || 8080;
 
 // Middleware
