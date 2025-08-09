@@ -5,7 +5,7 @@ class TwitterMonitor {
     this.apiKey = options.apiKey;
     this.sentimentAnalyzer = options.sentimentAnalyzer;
 
-    this.monitoringAccounts = [];
+    this.monitoringAccounts = []; // [{ id?: string, handle?: string }]
     this.isMonitoring = false;
     this.isFetching = false;
     this.tweets = [];
@@ -18,33 +18,50 @@ class TwitterMonitor {
     this.rateLimitRemaining = 100;
     this.rateLimitReset = null;
 
-    this.lastSeenIdByUser = {};
+    this.lastSeenIdByUser = {}; // key: handleOrId -> since_id
+    this.perRequestGapMs = 5500; // free tier pacing
 
-    // gap between per-account requests (free tier: 1 req / 5s)
-    this.perRequestGapMs = 5500;
+    // Default high-signal crypto list (handles). Override with TWITTER_ACCOUNTS
+    const defaultHandles = [
+      'elonmusk',
+      'vitalikbuterin',
+      'michael_saylor',
+      'justinsuntron',
+      'cz_binance',
+      'naval',
+      'APompliano',
+      'balajis',
+      'coinbureau',
+      'WhalePanda'
+    ];
 
-    // Auto-start on deploy. Allow env override for accounts.
-    const envAccounts = (process.env.TWITTER_ACCOUNTS || 'elonmusk,VitalikButerin,michael_saylor')
+    const envList = (process.env.TWITTER_ACCOUNTS || defaultHandles.join(','))
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
 
     if (this.apiKey) {
       console.log('🚀 Auto-starting Twitter monitoring...');
-      this.start(envAccounts)
+      this.start(envList)
         .then(() => console.log('✅ Twitter monitoring started automatically'))
-        .catch(err => console.error('❌ Failed to auto-start monitoring:', err.message));
+        .catch(err => console.error('❌ Failed to auto-start monitoring:', err?.message || err));
     } else {
       console.warn('⚠️ No TwitterAPI.io key found — monitoring not started.');
     }
   }
 
-  async start(accounts = ['elonmusk', 'VitalikButerin', 'michael_saylor']) {
+  // Accepts handles and/or numeric IDs (mix allowed)
+  async start(accounts = []) {
     if (this.isMonitoring) return { success: true, message: 'Already monitoring' };
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
-    // normalize to lowercase handles 404s due to casing
-    this.monitoringAccounts = [...new Set(accounts.map(a => a.toLowerCase().trim()))];
+    // Normalize into targets: { id? , handle? }
+    this.monitoringAccounts = [...new Set(accounts)].map(raw => {
+      const s = String(raw).trim();
+      if (/^\d+$/.test(s)) return { id: s }; // numeric user id
+      return { handle: s.replace(/^@/, '').toLowerCase() }; // handle
+    });
+
     this.isMonitoring = true;
 
     await this.fetchLatestTweets();
@@ -82,20 +99,16 @@ class TwitterMonitor {
       const newTweets = [];
 
       for (let i = 0; i < this.monitoringAccounts.length; i++) {
-        const account = this.monitoringAccounts[i];
+        const target = this.monitoringAccounts[i];
         try {
-          if (i > 0) {
-            // respect free-tier QPS
-            await new Promise(res => setTimeout(res, this.perRequestGapMs));
-          }
-          const userTweets = await this.fetchUserTweets(account);
+          if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs)); // pace for free tier
+          const userTweets = await this.fetchTweetsForTarget(target);
           newTweets.push(...userTweets);
-        } catch (err) {
-          // fetchUserTweets already logs; continue with next account
+        } catch {
+          // errors already logged in fetchTweetsForTarget
         }
       }
 
-      // newest first
       newTweets.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
       for (const tweet of newTweets) {
@@ -109,67 +122,69 @@ class TwitterMonitor {
     }
   }
 
-  async fetchUserTweets(username) {
+  async fetchTweetsForTarget(target) {
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
     const client = axios.create({
       baseURL: 'https://api.twitterapi.io',
-      headers: { 'x-api-key': this.apiKey },
+      headers: { 'x-api-key': this.apiKey }, // required by TwitterAPI.io
       timeout: 12_000
     });
 
-    const sinceId = this.lastSeenIdByUser[username];
+    const key = target.id || target.handle; // for since_id tracking and logs
+    const sinceId = this.lastSeenIdByUser[key];
     const params = { limit: 10, ...(sinceId ? { since_id: sinceId } : {}) };
 
-    // small helper to perform request with one retry on 429
+    const path = target.id
+      ? `/tweets/user-id/${encodeURIComponent(target.id)}`
+      : `/tweets/user/${encodeURIComponent(target.handle)}`;
+
     const requestWithRetry = async () => {
       try {
-        return await client.get(`/tweets/user/${encodeURIComponent(username)}`, { params });
+        return await client.get(path, { params });
       } catch (err) {
         const status = err?.response?.status;
         if (status === 429) {
-          console.warn(`429 for ${username} — backing off 6s then retrying once`);
+          console.warn(`429 for ${key} — backing off 6s then retrying once`);
           await new Promise(res => setTimeout(res, 6000));
-          return await client.get(`/tweets/user/${encodeURIComponent(username)}`, { params });
+          return await client.get(path, { params });
         }
         throw err;
       }
     };
 
     try {
-      const tweetsResp = await requestWithRetry();
-
-      const raw = tweetsResp?.data?.data || [];
+      const resp = await requestWithRetry();
+      const raw = resp?.data?.data || [];
       if (!Array.isArray(raw) || raw.length === 0) return [];
 
-      const mappedTweets = raw.map(t => ({
+      const author = target.handle || String(target.id);
+      const mapped = raw.map(t => ({
         id: t.id_str || t.id,
         text: t.full_text || t.text,
         created_at: t.created_at || t.date,
-        author: username,
+        author,
         public_metrics: t.metrics || t.public_metrics || {},
         context_annotations: t.context_annotations || [],
         entities: t.entities || {},
-        url: `https://x.com/${username}/status/${t.id_str || t.id}`
+        url: `https://x.com/${author}/status/${t.id_str || t.id}`
       }));
 
-      if (mappedTweets.length > 0) {
-        this.lastSeenIdByUser[username] = mappedTweets[0].id;
-      }
-
-      return mappedTweets;
+      if (mapped.length > 0) this.lastSeenIdByUser[key] = mapped[0].id;
+      return mapped;
     } catch (error) {
       const status = error?.response?.status;
       const data = error?.response?.data;
 
       if (status === 404) {
-        console.warn(`User not found on TwitterAPI.io: ${username}`);
+        console.warn(`User not found on TwitterAPI.io: ${key} (path: ${path})`);
         return [];
       }
 
       console.error(
-        `TwitterAPI.io error for ${username}${status ? ` [${status}]` : ''}: ` +
-        `${data ? JSON.stringify(data).slice(0, 300) : (error.message || 'Unknown error')}`
+        `TwitterAPI.io error for ${key}${status ? ` [${status}]` : ''}: ${
+          data ? JSON.stringify(data).slice(0, 300) : (error.message || 'Unknown error')
+        }`
       );
       throw error;
     }
