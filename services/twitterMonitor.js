@@ -1,50 +1,38 @@
 const axios = require('axios');
+const { resolveHandleToId } = require('./twitterUserResolver');
 
 class TwitterMonitor {
   constructor(options = {}) {
     this.apiKey = options.apiKey;
     this.sentimentAnalyzer = options.sentimentAnalyzer;
 
-    this.monitoringAccounts = []; // [{ id?: string, handle?: string }]
+    this.monitoringAccounts = [];      // [{ id?: string, handle?: string, label: string }]
+    this.resolutionCache = {};         // handle -> id
     this.isMonitoring = false;
     this.isFetching = false;
     this.tweets = [];
     this.maxTweets = 100;
 
-    // --- intervals & pacing (env configurable) ---
+    // pacing (env)
     const envPoll = parseInt(process.env.TWEET_CHECK_INTERVAL || '60000', 10);
-    this.pollInterval = Math.max(30000, isNaN(envPoll) ? 60000 : envPoll); // ≥30s, default 60s
+    this.pollInterval = Math.max(30000, isNaN(envPoll) ? 60000 : envPoll);
     const envGap = parseInt(process.env.PER_REQUEST_GAP_MS || '7000', 10);
-    this.perRequestGapMs = Math.max(5500, isNaN(envGap) ? 7000 : envGap);  // ≥5.5s, default 7s
+    this.perRequestGapMs = Math.max(5500, isNaN(envGap) ? 7000 : envGap);
     const envRetry = parseInt(process.env.RETRY_BACKOFF_MS || `${this.pollInterval}`, 10);
     this.retryBackoffMs = Math.max(this.perRequestGapMs, isNaN(envRetry) ? this.pollInterval : envRetry);
 
     this.intervalId = null;
     this.lastFetchTime = null;
-
     this.rateLimitRemaining = 100;
     this.rateLimitReset = null;
+    this.lastSeenIdByUser = {}; // key = id or handle -> since_id
 
-    this.lastSeenIdByUser = {}; // key: handleOrId -> since_id
-
-    // Default high-signal crypto list (handles). Override with TWITTER_ACCOUNTS
     const defaultHandles = [
-      'elonmusk',
-      'vitalikbuterin',
-      'michael_saylor',
-      'justinsuntron',
-      'cz_binance',
-      'naval',
-      'APompliano',
-      'balajis',
-      'coinbureau',
-      'WhalePanda'
+      'elonmusk','vitalikbuterin','michael_saylor','justinsuntron',
+      'cz_binance','naval','APompliano','balajis','coinbureau','WhalePanda'
     ];
-
     const envList = (process.env.TWITTER_ACCOUNTS || defaultHandles.join(','))
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
+      .split(',').map(s => s.trim()).filter(Boolean);
 
     if (this.apiKey) {
       console.log('🚀 Auto-starting Twitter monitoring...');
@@ -56,26 +44,43 @@ class TwitterMonitor {
     }
   }
 
-  // Accepts handles and/or numeric IDs (mix allowed)
+  // accepts mix of handles and numeric IDs
   async start(accounts = []) {
     if (this.isMonitoring) return { success: true, message: 'Already monitoring' };
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
-    // Normalize into targets: { id? , handle? }
-    this.monitoringAccounts = [...new Set(accounts)].map(raw => {
-      const s = String(raw).trim();
-      if (/^\d+$/.test(s)) return { id: s }; // numeric user id
-      return { handle: s.replace(/^@/, '').toLowerCase() }; // handle
-    });
+    const rawTargets = [...new Set(accounts)].map(s => String(s).trim()).filter(Boolean);
+    const targets = [];
 
+    for (let i = 0; i < rawTargets.length; i++) {
+      const v = rawTargets[i];
+      if (/^\d+$/.test(v)) { // already numeric ID
+        targets.push({ id: v, label: v });
+        continue;
+      }
+      const handle = v.replace(/^@/, '').toLowerCase();
+
+      if (!this.resolutionCache[handle]) {
+        if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
+        const res = await resolveHandleToId(handle);
+        if (res.id) {
+          this.resolutionCache[handle] = res.id;
+          console.log(`🔎 Resolved @${handle} -> ${res.id} (${res.source})`);
+        } else {
+          console.warn(`⚠️ Could not resolve @${handle} to ID (will call by handle, may 404)`);
+        }
+      }
+      const id = this.resolutionCache[handle];
+      targets.push(id ? { id, label: handle } : { handle, label: handle });
+    }
+
+    this.monitoringAccounts = targets;
     this.isMonitoring = true;
 
     await this.fetchLatestTweets();
 
     this.intervalId = setInterval(async () => {
-      try {
-        if (!this.isFetching) await this.fetchLatestTweets();
-      } catch { /* already logged */ }
+      try { if (!this.isFetching) await this.fetchLatestTweets(); } catch {}
     }, this.pollInterval);
 
     return {
@@ -103,23 +108,17 @@ class TwitterMonitor {
 
     try {
       const newTweets = [];
-
       for (let i = 0; i < this.monitoringAccounts.length; i++) {
         const target = this.monitoringAccounts[i];
         try {
-          if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs)); // pace for free tier
+          if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
           const userTweets = await this.fetchTweetsForTarget(target);
           newTweets.push(...userTweets);
-        } catch {
-          // errors already logged in fetchTweetsForTarget
-        }
+        } catch { /* logged inside */ }
       }
 
       newTweets.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-      for (const tweet of newTweets) {
-        await this.processTweet(tweet);
-      }
+      for (const t of newTweets) await this.processTweet(t);
 
       this.lastFetchTime = new Date().toISOString();
       return newTweets;
@@ -129,28 +128,24 @@ class TwitterMonitor {
   }
 
   async fetchTweetsForTarget(target) {
-    if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
-
     const client = axios.create({
       baseURL: 'https://api.twitterapi.io',
-      headers: { 'x-api-key': this.apiKey }, // required by TwitterAPI.io
-      timeout: 12_000
+      headers: { 'x-api-key': this.apiKey },
+      timeout: 12000
     });
 
-    const key = target.id || target.handle; // for since_id tracking and logs
-    const sinceId = this.lastSeenIdByUser[key];
-    const params = { limit: 10, ...(sinceId ? { since_id: sinceId } : {}) };
-
+    const key = target.id || target.handle;
     const path = target.id
       ? `/tweets/user-id/${encodeURIComponent(target.id)}`
       : `/tweets/user/${encodeURIComponent(target.handle)}`;
+    const sinceId = this.lastSeenIdByUser[key];
+    const params = { limit: 10, ...(sinceId ? { since_id: sinceId } : {}) };
 
     const requestWithRetry = async () => {
       try {
         return await client.get(path, { params });
       } catch (err) {
-        const status = err?.response?.status;
-        if (status === 429) {
+        if (err?.response?.status === 429) {
           console.warn(`429 for ${key} — backing off ${this.retryBackoffMs}ms then retrying once`);
           await new Promise(res => setTimeout(res, this.retryBackoffMs));
           return await client.get(path, { params });
@@ -164,7 +159,7 @@ class TwitterMonitor {
       const raw = resp?.data?.data || [];
       if (!Array.isArray(raw) || raw.length === 0) return [];
 
-      const author = target.handle || String(target.id);
+      const author = target.label || target.handle || String(target.id);
       const mapped = raw.map(t => ({
         id: t.id_str || t.id,
         text: t.full_text || t.text,
@@ -180,16 +175,16 @@ class TwitterMonitor {
       return mapped;
     } catch (error) {
       const status = error?.response?.status;
-      const data = error?.response?.data;
-
-      if (status === 404) {
-        console.warn(`User not found on TwitterAPI.io: ${key} (path: ${path})`);
+      if (status === 404 && target.handle) {
+        // drop cached mapping and try to re-resolve next cycle
+        delete this.resolutionCache[target.handle];
+        console.warn(`User not found on TwitterAPI.io: ${key} — will re-resolve handle next cycle`);
         return [];
       }
-
+      const data = error?.response?.data;
       console.error(
         `TwitterAPI.io error for ${key}${status ? ` [${status}]` : ''}: ${
-          data ? JSON.stringify(data).slice(0, 300) : (error.message || 'Unknown error')
+          data ? JSON.stringify(data).slice(0,300) : (error.message || 'Unknown error')
         }`
       );
       throw error;
