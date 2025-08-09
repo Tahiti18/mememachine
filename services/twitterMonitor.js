@@ -1,14 +1,25 @@
 const axios = require('axios');
-const { resolveHandleToIdWithSource } = require('./twitterUserResolver');
+
+// ---- Hard-coded IDs (no lookups; stable even if handles change)
+const ID_MAP = {
+  elonmusk:       '44196397',
+  vitalikbuterin: '295218901',
+  michael_saylor: '244647486',
+  justinsuntron:  '1023900737',
+  cz_binance:     '888059910',
+  naval:          '745273',
+  APompliano:     '361289499',
+  balajis:        '36563169',
+  coinbureau:     '1109836680455862273',
+  WhalePanda:     '14198485'
+};
 
 class TwitterMonitor {
   constructor(options = {}) {
     this.apiKey = options.apiKey;
     this.sentimentAnalyzer = options.sentimentAnalyzer;
 
-    this.monitoringAccounts = [];      // [{ id?: string, handle?: string, label: string }]
-    this.resolutionCache = {};         // handle -> id
-    this.resolutionSource = {};        // handle -> source (e.g., local-map)
+    this.monitoringAccounts = [];  // [{ id, label }]
     this.isMonitoring = false;
     this.isFetching = false;
     this.tweets = [];
@@ -26,8 +37,9 @@ class TwitterMonitor {
     this.lastFetchTime = null;
     this.rateLimitRemaining = 100;
     this.rateLimitReset = null;
-    this.lastSeenIdByUser = {}; // key = id or handle -> since_id
+    this.lastSeenIdByUser = {}; // key=id -> since_id
 
+    // default list uses known handles; we immediately map to IDs from ID_MAP
     const defaultHandles = [
       'elonmusk','vitalikbuterin','michael_saylor','justinsuntron',
       'cz_binance','naval','APompliano','balajis','coinbureau','WhalePanda'
@@ -45,35 +57,31 @@ class TwitterMonitor {
     }
   }
 
-  // accepts mix of handles and numeric IDs
+  // Accepts mix of handles and numeric IDs; prefers hard-coded IDs; skips any unknown handle
   async start(accounts = []) {
     if (this.isMonitoring) return { success: true, message: 'Already monitoring' };
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
-    const rawTargets = [...new Set(accounts)].map(s => String(s).trim()).filter(Boolean);
     const targets = [];
+    const unique = [...new Set(accounts)].map(v => String(v).trim()).filter(Boolean);
 
-    for (let i = 0; i < rawTargets.length; i++) {
-      const v = rawTargets[i];
-      if (/^\d+$/.test(v)) { // already numeric ID
+    for (const v of unique) {
+      if (/^\d+$/.test(v)) { // numeric id provided
         targets.push({ id: v, label: v });
         continue;
       }
-      const handle = v.replace(/^@/, '').toLowerCase();
-
-      if (!this.resolutionCache[handle]) {
-        if (i > 0) await new Promise(r => setTimeout(r, this.perRequestGapMs));
-        const { id: resolvedId, source } = await resolveHandleToIdWithSource(handle);
-        if (resolvedId) {
-          this.resolutionCache[handle] = resolvedId;
-          this.resolutionSource[handle] = source || 'local-map';
-          console.log(`🔎 Resolved @${handle} -> ${resolvedId} (${this.resolutionSource[handle]})`);
-        } else {
-          console.warn(`⚠️ Could not resolve @${handle} to ID (will call by handle, may 404)`);
-        }
+      const handle = v.replace(/^@/, '');
+      const id = ID_MAP[handle] || ID_MAP[handle.toLowerCase()];
+      if (id) {
+        console.log(`🔒 Using hard-coded ID for @${handle} -> ${id} (local-map)`);
+        targets.push({ id, label: handle });
+      } else {
+        console.warn(`⏭️ Skipping @${handle}: not in local ID map (no lookups in this mode)`);
       }
-      const id = this.resolutionCache[handle];
-      targets.push(id ? { id, label: handle } : { handle, label: handle });
+    }
+
+    if (targets.length === 0) {
+      throw new Error('No valid accounts after applying hard-coded ID map.');
     }
 
     this.monitoringAccounts = targets;
@@ -87,7 +95,7 @@ class TwitterMonitor {
 
     return {
       success: true,
-      message: 'Monitoring started',
+      message: 'Monitoring started (local-map mode)',
       accounts: this.monitoringAccounts,
       pollInterval: this.pollInterval
     };
@@ -95,10 +103,7 @@ class TwitterMonitor {
 
   async stop() {
     if (!this.isMonitoring) return { success: true, message: 'Already stopped' };
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
+    if (this.intervalId) { clearInterval(this.intervalId); this.intervalId = null; }
     this.isMonitoring = false;
     return { success: true, message: 'Monitoring stopped' };
   }
@@ -136,19 +141,23 @@ class TwitterMonitor {
       timeout: 12000
     });
 
-    const key = target.id || target.handle;
-    const path = target.id
-      ? `/tweets/user-id/${encodeURIComponent(target.id)}`
-      : `/tweets/user/${encodeURIComponent(target.handle)}`;
+    const key = target.id; // in this mode we always have an id
     const sinceId = this.lastSeenIdByUser[key];
     const params = { limit: 10, ...(sinceId ? { since_id: sinceId } : {}) };
 
-    const requestWithRetry = async () => {
+    // Prefer ID endpoint; if provider lacks it, optionally fall back to handle endpoint (rare)
+    const paths = [
+      `/tweets/user-id/${encodeURIComponent(key)}`,
+      // fallback would require a handle; we skip since this mode is ID-only to avoid 404s:
+      // `/tweets/user/${encodeURIComponent(target.label)}`
+    ];
+
+    const requestWithRetry = async (path) => {
       try {
         return await client.get(path, { params });
       } catch (err) {
         if (err?.response?.status === 429) {
-          console.warn(`429 for ${key} — backing off ${this.retryBackoffMs}ms then retrying once`);
+          console.warn(`429 for ${key} — backoff ${this.retryBackoffMs}ms then retry once`);
           await new Promise(res => setTimeout(res, this.retryBackoffMs));
           return await client.get(path, { params });
         }
@@ -157,11 +166,19 @@ class TwitterMonitor {
     };
 
     try {
-      const resp = await requestWithRetry();
+      let resp;
+      for (const p of paths) {
+        try { resp = await requestWithRetry(p); break; }
+        catch (e) {
+          const st = e?.response?.status;
+          console.warn(`TwitterAPI.io error for ${key} on ${p} [${st || 'ERR'}]`);
+          if (st && st !== 404) throw e; // non-404 -> abort
+        }
+      }
       const raw = resp?.data?.data || [];
       if (!Array.isArray(raw) || raw.length === 0) return [];
 
-      const author = target.label || target.handle || String(target.id);
+      const author = target.label || String(target.id);
       const mapped = raw.map(t => ({
         id: t.id_str || t.id,
         text: t.full_text || t.text,
@@ -176,20 +193,14 @@ class TwitterMonitor {
       if (mapped.length > 0) this.lastSeenIdByUser[key] = mapped[0].id;
       return mapped;
     } catch (error) {
-      const status = error?.response?.status;
-      if (status === 404 && target.handle) {
-        // drop cached mapping and try to re-resolve next cycle
-        delete this.resolutionCache[target.handle];
-        console.warn(`User not found on TwitterAPI.io: ${key} — will re-resolve handle next cycle`);
-        return [];
-      }
       const data = error?.response?.data;
+      const status = error?.response?.status;
       console.error(
-        `TwitterAPI.io error for ${key}${status ? ` [${status}]` : ''}: ${
+        `TwitterAPI.io final error for ${key}${status ? ` [${status}]` : ''}: ${
           data ? JSON.stringify(data).slice(0,300) : (error.message || 'Unknown error')
         }`
       );
-      throw error;
+      return []; // swallow to keep loop healthy
     }
   }
 
@@ -209,9 +220,7 @@ class TwitterMonitor {
               context_annotations: tweet.context_annotations
             }
           });
-        } catch {
-          analysis = this.getFallbackAnalysis(tweet);
-        }
+        } catch { analysis = this.getFallbackAnalysis(tweet); }
       } else {
         analysis = this.getFallbackAnalysis(tweet);
       }
@@ -256,7 +265,6 @@ class TwitterMonitor {
     try {
       if (!tweet.analysis) return;
       const { sentiment, viral, impact } = tweet.analysis;
-
       if (impact > 85 && sentiment > 80) await this.triggerAlert('HIGH_IMPACT', tweet);
       if (viral > 80) await this.triggerAlert('VIRAL_POTENTIAL', tweet);
       if ((sentiment > 90 || sentiment < 20) && impact > 60)
@@ -267,13 +275,12 @@ class TwitterMonitor {
   }
 
   async triggerAlert(type, tweet) {
-    const alertData = {
+    return {
       type,
       tweet,
       timestamp: new Date().toISOString(),
       priority: type === 'HIGH_IMPACT' ? 'critical' : 'high'
     };
-    return alertData;
   }
 
   addTweet(tweet) {
@@ -283,13 +290,7 @@ class TwitterMonitor {
     }
   }
 
-  async getRecentTweets(limit = 20) {
-    try {
-      return this.tweets.slice(0, limit);
-    } catch {
-      return [];
-    }
-  }
+  async getRecentTweets(limit = 20) { return this.tweets.slice(0, limit); }
 
   getStatus() {
     return {
@@ -301,82 +302,9 @@ class TwitterMonitor {
       rateLimitRemaining: this.rateLimitRemaining,
       rateLimitReset: this.rateLimitReset,
       recentActivity: this.tweets.slice(0, 5).map(t => ({
-        id: t.id,
-        author: t.author,
-        text: t.text.substring(0, 100),
-        signal: t.signal,
-        processed_at: t.processed_at
+        id: t.id, author: t.author, text: t.text.substring(0, 100),
+        signal: t.signal, processed_at: t.processed_at
       }))
-    };
-  }
-
-  updateRateLimitInfo(headers) {
-    if (headers?.['x-rate-limit-remaining']) {
-      this.rateLimitRemaining = parseInt(headers['x-rate-limit-remaining'], 10);
-    }
-    if (headers?.['x-rate-limit-reset']) {
-      this.rateLimitReset = new Date(parseInt(headers['x-rate-limit-reset'], 10) * 1000);
-    }
-  }
-
-  getTweetsByAuthor(author, limit = 10) {
-    return this.tweets
-      .filter(t => t.author.toLowerCase() === author.toLowerCase())
-      .slice(0, limit);
-  }
-
-  getHighSentimentTweets(threshold = 80, limit = 10) {
-    return this.tweets
-      .filter(t => t.analysis && t.analysis.sentiment >= threshold)
-      .slice(0, limit);
-  }
-
-  getTweetsBySignal(signal = 'HIGH', limit = 10) {
-    return this.tweets
-      .filter(t => t.signal === signal)
-      .slice(0, limit);
-  }
-
-  clearOldTweets(olderThanHours = 24) {
-    const cutoffTime = new Date(Date.now() - olderThanHours * 60 * 60 * 1000);
-    const before = this.tweets.length;
-    this.tweets = this.tweets.filter(t => new Date(t.created_at) > cutoffTime);
-    return before - this.tweets.length;
-  }
-
-  getStatistics() {
-    if (this.tweets.length === 0) {
-      return { totalTweets: 0, averageSentiment: 0, highSignalTweets: 0, topAuthors: [] };
-    }
-
-    const totalTweets = this.tweets.length;
-    const sentiments = this.tweets
-      .filter(t => t.analysis && typeof t.analysis.sentiment === 'number')
-      .map(t => t.analysis.sentiment);
-    const avgSent = sentiments.length
-      ? Math.round(sentiments.reduce((a, b) => a + b, 0) / sentiments.length)
-      : 0;
-
-    const highSignalTweets = this.tweets.filter(t => t.signal === 'HIGH').length;
-
-    const authorCounts = {};
-    this.tweets.forEach(t => {
-      authorCounts[t.author] = (authorCounts[t.author] || 0) + 1;
-    });
-    const topAuthors = Object.entries(authorCounts)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 5)
-      .map(([author, count]) => ({ author, count }));
-
-    return {
-      totalTweets,
-      averageSentiment: avgSent,
-      highSignalTweets,
-      topAuthors,
-      rateLimitInfo: {
-        remaining: this.rateLimitRemaining,
-        resetTime: this.rateLimitReset
-      }
     };
   }
 }
