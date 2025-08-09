@@ -50,7 +50,7 @@ class TwitterMonitor {
           await this.fetchLatestTweets();
         }
       } catch {
-        // errors are already logged
+        // errors already logged
       }
     }, this.pollInterval);
 
@@ -111,7 +111,7 @@ class TwitterMonitor {
     const client = axios.create({
       baseURL: 'https://api.twitterapi.io',
       headers: {
-        Authorization: `Bearer ${this.apiKey}`
+        'x-api-key': this.apiKey  // ✅ FIXED HEADER
       },
       timeout: 12_000
     });
