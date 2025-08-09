@@ -20,10 +20,18 @@ class TwitterMonitor {
 
     this.lastSeenIdByUser = {};
 
-    // ✅ AUTO-START on deploy
+    // gap between per-account requests (free tier: 1 req / 5s)
+    this.perRequestGapMs = 5500;
+
+    // Auto-start on deploy. Allow env override for accounts.
+    const envAccounts = (process.env.TWITTER_ACCOUNTS || 'elonmusk,VitalikButerin,michael_saylor')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
     if (this.apiKey) {
       console.log('🚀 Auto-starting Twitter monitoring...');
-      this.start(['elonmusk', 'VitalikButerin', 'michael_saylor'])
+      this.start(envAccounts)
         .then(() => console.log('✅ Twitter monitoring started automatically'))
         .catch(err => console.error('❌ Failed to auto-start monitoring:', err.message));
     } else {
@@ -32,26 +40,19 @@ class TwitterMonitor {
   }
 
   async start(accounts = ['elonmusk', 'VitalikButerin', 'michael_saylor']) {
-    if (this.isMonitoring) {
-      return { success: true, message: 'Already monitoring' };
-    }
-    if (!this.apiKey) {
-      throw new Error('TwitterAPI.io API key not configured');
-    }
+    if (this.isMonitoring) return { success: true, message: 'Already monitoring' };
+    if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
 
-    this.monitoringAccounts = accounts;
+    // normalize to lowercase handles 404s due to casing
+    this.monitoringAccounts = [...new Set(accounts.map(a => a.toLowerCase().trim()))];
     this.isMonitoring = true;
 
     await this.fetchLatestTweets();
 
     this.intervalId = setInterval(async () => {
       try {
-        if (!this.isFetching) {
-          await this.fetchLatestTweets();
-        }
-      } catch {
-        // errors already logged
-      }
+        if (!this.isFetching) await this.fetchLatestTweets();
+      } catch { /* already logged */ }
     }, this.pollInterval);
 
     return {
@@ -63,9 +64,7 @@ class TwitterMonitor {
   }
 
   async stop() {
-    if (!this.isMonitoring) {
-      return { success: true, message: 'Already stopped' };
-    }
+    if (!this.isMonitoring) return { success: true, message: 'Already stopped' };
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
@@ -76,22 +75,27 @@ class TwitterMonitor {
 
   async fetchLatestTweets() {
     if (!this.apiKey) throw new Error('TwitterAPI.io API key not configured');
-
     if (this.isFetching) return [];
     this.isFetching = true;
 
     try {
       const newTweets = [];
 
-      for (const account of this.monitoringAccounts) {
+      for (let i = 0; i < this.monitoringAccounts.length; i++) {
+        const account = this.monitoringAccounts[i];
         try {
+          if (i > 0) {
+            // respect free-tier QPS
+            await new Promise(res => setTimeout(res, this.perRequestGapMs));
+          }
           const userTweets = await this.fetchUserTweets(account);
           newTweets.push(...userTweets);
-        } catch {
-          // already logged
+        } catch (err) {
+          // fetchUserTweets already logs; continue with next account
         }
       }
 
+      // newest first
       newTweets.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
       for (const tweet of newTweets) {
@@ -110,20 +114,30 @@ class TwitterMonitor {
 
     const client = axios.create({
       baseURL: 'https://api.twitterapi.io',
-      headers: {
-        'x-api-key': this.apiKey  // ✅ FIXED HEADER
-      },
+      headers: { 'x-api-key': this.apiKey },
       timeout: 12_000
     });
 
-    try {
-      const sinceId = this.lastSeenIdByUser[username];
-      const params = {
-        limit: 10,
-        ...(sinceId ? { since_id: sinceId } : {})
-      };
+    const sinceId = this.lastSeenIdByUser[username];
+    const params = { limit: 10, ...(sinceId ? { since_id: sinceId } : {}) };
 
-      const tweetsResp = await client.get(`/tweets/user/${encodeURIComponent(username)}`, { params });
+    // small helper to perform request with one retry on 429
+    const requestWithRetry = async () => {
+      try {
+        return await client.get(`/tweets/user/${encodeURIComponent(username)}`, { params });
+      } catch (err) {
+        const status = err?.response?.status;
+        if (status === 429) {
+          console.warn(`429 for ${username} — backing off 6s then retrying once`);
+          await new Promise(res => setTimeout(res, 6000));
+          return await client.get(`/tweets/user/${encodeURIComponent(username)}`, { params });
+        }
+        throw err;
+      }
+    };
+
+    try {
+      const tweetsResp = await requestWithRetry();
 
       const raw = tweetsResp?.data?.data || [];
       if (!Array.isArray(raw) || raw.length === 0) return [];
@@ -147,7 +161,16 @@ class TwitterMonitor {
     } catch (error) {
       const status = error?.response?.status;
       const data = error?.response?.data;
-      console.error(`TwitterAPI.io error for ${username}${status ? ` [${status}]` : ''}: ${data ? JSON.stringify(data).slice(0, 300) : error.message}`);
+
+      if (status === 404) {
+        console.warn(`User not found on TwitterAPI.io: ${username}`);
+        return [];
+      }
+
+      console.error(
+        `TwitterAPI.io error for ${username}${status ? ` [${status}]` : ''}: ` +
+        `${data ? JSON.stringify(data).slice(0, 300) : (error.message || 'Unknown error')}`
+      );
       throw error;
     }
   }
@@ -203,7 +226,8 @@ class TwitterMonitor {
   estimateImpactFromMetrics(tweet) {
     if (!tweet.public_metrics) return 30;
     const m = tweet.public_metrics;
-    const engagement = (m.like_count || 0) + (m.retweet_count || 0) + (m.reply_count || 0) + (m.quote_count || 0);
+    const engagement =
+      (m.like_count || 0) + (m.retweet_count || 0) + (m.reply_count || 0) + (m.quote_count || 0);
     if (engagement > 10000) return 90;
     if (engagement > 1000) return 70;
     if (engagement > 100) return 50;
@@ -215,15 +239,10 @@ class TwitterMonitor {
       if (!tweet.analysis) return;
       const { sentiment, viral, impact } = tweet.analysis;
 
-      if (impact > 85 && sentiment > 80) {
-        await this.triggerAlert('HIGH_IMPACT', tweet);
-      }
-      if (viral > 80) {
-        await this.triggerAlert('VIRAL_POTENTIAL', tweet);
-      }
-      if ((sentiment > 90 || sentiment < 20) && impact > 60) {
+      if (impact > 85 && sentiment > 80) await this.triggerAlert('HIGH_IMPACT', tweet);
+      if (viral > 80) await this.triggerAlert('VIRAL_POTENTIAL', tweet);
+      if ((sentiment > 90 || sentiment < 20) && impact > 60)
         await this.triggerAlert('MARKET_MOVING', tweet);
-      }
     } catch (error) {
       console.error('Tweet trigger check failed:', error?.message || error);
     }
@@ -316,14 +335,18 @@ class TwitterMonitor {
     const sentiments = this.tweets
       .filter(t => t.analysis && typeof t.analysis.sentiment === 'number')
       .map(t => t.analysis.sentiment);
-    const avgSent = sentiments.length ? Math.round(sentiments.reduce((a, b) => a + b, 0) / sentiments.length) : 0;
+    const avgSent = sentiments.length
+      ? Math.round(sentiments.reduce((a, b) => a + b, 0) / sentiments.length)
+      : 0;
 
     const highSignalTweets = this.tweets.filter(t => t.signal === 'HIGH').length;
 
     const authorCounts = {};
-    this.tweets.forEach(t => { authorCounts[t.author] = (authorCounts[t.author] || 0) + 1; });
+    this.tweets.forEach(t => {
+      authorCounts[t.author] = (authorCounts[t.author] || 0) + 1;
+    });
     const topAuthors = Object.entries(authorCounts)
-      .sort(([,a], [,b]) => b - a)
+      .sort(([, a], [, b]) => b - a)
       .slice(0, 5)
       .map(([author, count]) => ({ author, count }));
 
